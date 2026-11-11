@@ -198,4 +198,70 @@ class FermataTest {
         assertTrue(next.timestamp > T0) // still after the newest stored event
         assertEquals(3, again.library().history.size)
     }
+
+    @Test
+    fun recordAtUsesTheGivenTimeButKeepsTheClockRule() {
+        val clock = ManualClock(T0)
+        val f = fermata("p", clock)
+        val first = f.record(EventBody.Play(a, 60_000), at = T0 - 5 * MINUTE)
+        assertEquals(T0 - 5 * MINUTE, first.timestamp)
+        // A time stored inside the body, taken from timestamp() first, matches the event's own.
+        val counted = f.timestamp()
+        val play = f.record(EventBody.Play(b, 40_000, countedAt = counted), at = counted)
+        assertEquals(counted, play.timestamp)
+        assertEquals(counted, (play.body as EventBody.Play).countedAt)
+        // A time earlier than the newest event is moved to newest + 1 ms, as for record() without it.
+        val late = f.record(EventBody.Play(c, 10_000), at = T0 - HOUR)
+        assertEquals(play.timestamp + 1, late.timestamp)
+    }
+
+    @Test
+    fun transactionDropsWhatAFailedBlockRecordedFromTheProjections() {
+        val clock = ManualClock(T0)
+        val store = InMemoryEventStore()
+        val f = fermata("p", clock, store)
+        f.record(EventBody.Like(Subject.Track(a)))
+        val result = f.transaction { f.record(EventBody.Like(Subject.Track(b))); "ok" }
+        assertEquals("ok", result)
+        assertEquals(setOf("A", "B"), f.library().likedTracks.map { it.track.id }.toSet())
+
+        // An app database that rolls back: the block records, then the store loses the event.
+        val failed = runCatching {
+            f.transaction {
+                val e = f.record(EventBody.Like(Subject.Track(c)))
+                store.removeAll(listOf(e.id))
+                error("rolled back")
+            }
+        }
+        assertTrue(failed.isFailure)
+        assertEquals(setOf("A", "B"), f.library().likedTracks.map { it.track.id }.toSet())
+        // The counter never goes back, so the next id is new even though one was rolled back.
+        val next = f.record(EventBody.Like(Subject.Track(c)))
+        assertEquals(4L, next.id.counter)
+    }
+
+    @Test
+    fun transactionHoldsTheLockSoABackgroundMergeWaits() {
+        val clock = ManualClock(T0)
+        val f = fermata("p", clock)
+        val other = fermata("q", ManualClock(T0))
+        val incoming = other.record(EventBody.Like(Subject.Track(c)))
+        val order = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val merger = Thread {
+            entered.await()
+            f.merge(listOf(incoming))
+            order += "merge"
+        }
+        merger.start()
+        f.transaction {
+            entered.countDown()
+            Thread.sleep(200)
+            f.record(EventBody.Like(Subject.Track(a)))
+            order += "write"
+        }
+        merger.join(5_000)
+        assertEquals(listOf("write", "merge"), order)
+        assertEquals(2L, f.eventCount())
+    }
 }

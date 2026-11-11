@@ -102,4 +102,70 @@ class SqliteEventStoreTest {
             context.deleteDatabase(name)
         }
     }
+
+    /** An app database with its own table and the log as table "fermata_log", as Minim 5.10.0 keeps it. */
+    private class AppDb(context: android.content.Context, name: String?) :
+        android.database.sqlite.SQLiteOpenHelper(context, name, null, 1) {
+        override fun onCreate(db: android.database.sqlite.SQLiteDatabase) {
+            db.execSQL("CREATE TABLE likes (track TEXT PRIMARY KEY NOT NULL)")
+            SqliteEventStore.createSchema(db, "fermata_log")
+        }
+        override fun onUpgrade(db: android.database.sqlite.SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    }
+
+    @Test
+    fun aLogInsideTheAppDatabaseSharesItsTransaction() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val helper = AppDb(context, null)
+        try {
+            val log = SqliteEventStore.inDatabase("fermata_log") { helper.writableDatabase }
+            val fermata = Fermata(log, "phone")
+            val db = helper.writableDatabase
+
+            // Committed: the app's row and the event land together.
+            fermata.transaction {
+                db.beginTransaction()
+                try {
+                    db.execSQL("INSERT INTO likes VALUES ('A')")
+                    fermata.record(EventBody.Like(Subject.Track(TrackRef("A"))))
+                    db.setTransactionSuccessful()
+                } finally {
+                    db.endTransaction()
+                }
+            }
+            // Rolled back (the app's write fails after the event was recorded): neither stays.
+            val failed = runCatching {
+                fermata.transaction {
+                    db.beginTransaction()
+                    try {
+                        fermata.record(EventBody.Like(Subject.Track(TrackRef("B"))))
+                        db.execSQL("INSERT INTO likes VALUES ('A')") // primary key clash
+                        db.setTransactionSuccessful()
+                    } finally {
+                        db.endTransaction()
+                    }
+                }
+            }
+            assertTrue(failed.isFailure)
+            assertEquals(1L, log.count())
+            assertEquals(1L, android.database.DatabaseUtils.queryNumEntries(db, "likes"))
+            assertEquals(listOf("A"), fermata.library().likedTracks.map { it.track.id })
+            // The rolled-back id is not reused.
+            assertEquals(3L, fermata.record(EventBody.Like(Subject.Track(TrackRef("C")))).id.counter)
+
+            // The table name is the app's: the default "events" table does not exist in this file.
+            assertFalse(db.rawQuery("SELECT name FROM sqlite_master WHERE name = 'events'", null).use { it.moveToFirst() })
+            // History clears keep heads in the log's own floors table.
+            fermata.record(EventBody.Play(TrackRef("A"), 60_000))
+            fermata.clearHistory()
+            assertTrue(db.rawQuery("SELECT 1 FROM fermata_log_head_floors", null).use { it.moveToFirst() })
+            assertEquals(log.heads(), mapOf("phone" to 5L))
+            // createSchema is safe to run again on every upgrade.
+            SqliteEventStore.createSchema(db, "fermata_log")
+            // Like A, like C and the clear stay; the play was cleared.
+            assertEquals(3L, log.count())
+        } finally {
+            helper.close()
+        }
+    }
 }

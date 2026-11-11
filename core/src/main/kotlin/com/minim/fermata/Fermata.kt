@@ -89,8 +89,14 @@ class Fermata(
         source: Source = Source.UNKNOWN,
         sessionId: String? = null,
         previousTrackId: String? = null,
+        /**
+         * The time to record at, normally left out (now). An app that has to store the time inside
+         * the event body takes it from [timestamp] first and passes it here, so both agree. The
+         * clock rule still applies: never earlier than the newest event + 1 ms.
+         */
+        at: Long? = null,
     ): Event = synchronized(lock) {
-        val wall = clock.millis()
+        val wall = at ?: clock.millis()
         val ts = if (lastTimestamp == Long.MIN_VALUE) wall else maxOf(wall, lastTimestamp + 1)
         if (session == null || wall - lastWall >= sessionGapMs) {
             session = "$deviceId.${counter + 1}"
@@ -260,6 +266,26 @@ class Fermata(
         invalidate()
         built()
         RestoreStats(added, events.size)
+    }
+
+    /**
+     * Runs [block] while holding Fermata's lock. An app that keeps the log inside its own
+     * database (see `SqliteEventStore.inDatabase`) opens its database transaction inside [block]
+     * and calls [record] there: the lock is re-entrant, and taking it first keeps one lock order
+     * (Fermata, then the database) for every caller, so a write on the main path can never
+     * deadlock against a merge or restore running on a background thread. If [block] throws,
+     * the in-memory projections are dropped so they are rebuilt from what the store really holds.
+     */
+    fun <T> transaction(block: () -> T): T = synchronized(lock) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            // The counter and clock only ever move forward, so they stay as they are; the clear
+            // point and projections are read again from the store.
+            clearPointRead = false
+            invalidate()
+            throw t
+        }
     }
 
     /**
