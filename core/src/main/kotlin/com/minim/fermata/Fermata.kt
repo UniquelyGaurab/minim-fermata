@@ -64,14 +64,19 @@ class Fermata(
     private var session: String? = null
     private var lastWall: Long = Long.MIN_VALUE
     private var lastTrack: String? = null
+    /** The track before [lastTrack], so a skip of the track just played keeps its own previous track. */
+    private var lastTrackPrev: String? = null
     private var projector: LibraryProjector? = null
     private var model: TasteModel? = null
     private var librarySnapshot: LibraryState? = null
 
     /**
      * Records something that just happened on this phone. When [sessionId] is null Fermata keeps
-     * the session itself (new session after [sessionGapMs] of silence); when [previousTrackId] is
-     * null it fills in the track played or skipped before, within the session.
+     * the session itself (new session after [sessionGapMs] or more of silence); when
+     * [previousTrackId] is null it fills in the track played or skipped before, within the
+     * session. A skip of the track just played gets that play's previous track, as in Minim
+     * 5.9.0's rows. Session ids are opaque strings: Fermata's own are `device.counter`, Minim
+     * 5.9.0's are UUIDs, and nothing parses them.
      */
     fun record(
         body: EventBody,
@@ -81,12 +86,18 @@ class Fermata(
     ): Event = synchronized(lock) {
         val wall = clock.millis()
         val ts = if (lastTimestamp == Long.MIN_VALUE) wall else maxOf(wall, lastTimestamp + 1)
-        if (session == null || wall - lastWall > sessionGapMs) {
+        if (session == null || wall - lastWall >= sessionGapMs) {
             session = "$deviceId.${counter + 1}"
             lastTrack = null
+            lastTrackPrev = null
         }
         val listenedTrack = listenedTrackId(body)
-        val prev = previousTrackId ?: if (listenedTrack != null) lastTrack else null
+        val skipOfLast = body is EventBody.Skip && listenedTrack == lastTrack
+        val prev = previousTrackId ?: when {
+            listenedTrack == null -> null
+            skipOfLast -> lastTrackPrev
+            else -> lastTrack
+        }
         val event = Event(
             EventId(deviceId, ++counter),
             EventContext.at(ts, zone, sessionId ?: session, prev, source, wallTime = wall),
@@ -95,7 +106,10 @@ class Fermata(
         store.append(event)
         lastTimestamp = ts
         lastWall = wall
-        if (listenedTrack != null) lastTrack = listenedTrack
+        if (listenedTrack != null && !skipOfLast) {
+            lastTrackPrev = prev
+            lastTrack = listenedTrack
+        }
         applyLocal(event)
         event
     }
@@ -115,7 +129,9 @@ class Fermata(
         val eventId = id ?: EventId(deviceId, counter + 1)
         val event = Event(eventId, EventContext.at(timestamp, zone, sessionId, previousTrackId, source), body)
         if (!store.append(event)) return null
-        if (id == null) counter++
+        // An imported id of this device (a 5.9.0 row, say) moves the counter past it, so the
+        // next record() never reuses it.
+        if (eventId.device == deviceId && eventId.counter > counter) counter = eventId.counter
         if (timestamp > lastTimestamp) lastTimestamp = timestamp
         applyLocal(event)
         event
@@ -133,9 +149,21 @@ class Fermata(
         val added = store.appendAll(events)
         if (added > 0) {
             store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
+            // Events of this device that came back (its own rows imported, say) move the counter on.
+            store.heads()[deviceId]?.let { if (it > counter) counter = it }
             invalidate()
         }
         added
+    }
+
+    /**
+     * Imports Minim's history once, when Fermata is first wired in: the 5.9.0 `fermata_events`
+     * rows under their own ids (device id + row id), the old `plays` and `tape_plays` rows under
+     * legacy ids, each play counted once. Safe to repeat. See [MinimImport].
+     */
+    fun importMinim(tables: MinimTables): MinimImportResult {
+        val result = MinimImport.convert(tables, zone)
+        return result.copy(added = merge(result.events))
     }
 
     fun library(): LibraryState = synchronized(lock) {
@@ -192,7 +220,7 @@ class Fermata(
         val p = projector
         val m = model
         if (p != null && m != null) return p to m
-        val log = EventLog.canonical(store.all())
+        val log = EventLog.effective(store.all())
         val newProjector = LibraryProjector(config.countedPlayMs)
         val newModel = TasteModel(config)
         for (e in log) {
@@ -208,6 +236,8 @@ class Fermata(
     private fun applyLocal(event: Event) {
         val p = projector ?: return
         val m = model ?: return
+        // A replacing event, or a legacy one that may already be replaced, needs the full rebuild.
+        if (event.ctx.replaces != null || event.id.device == EventId.LEGACY_DEVICE) return invalidate()
         if (p.apply(event)) {
             m.apply(event)
             librarySnapshot = null

@@ -64,7 +64,9 @@ class TasteModel(val config: RecsConfig = RecsConfig()) {
         val w = config.weights
         val t = event.timestamp
         when (val b = event.body) {
-            is EventBody.Play -> {
+            // A play row with nothing heard (Minim 5.9.0 writes one for every track that left the
+            // player) says nothing about taste; a skip, if any, is its own event.
+            is EventBody.Play -> if (b.listenedMs > 0) {
                 signals++
                 val counted = b.listenedMs >= config.countedPlayMs ||
                     (b.track.durationMs > 0 && b.listenedMs >= b.track.durationMs / 2)
@@ -171,10 +173,10 @@ class TasteModel(val config: RecsConfig = RecsConfig()) {
     }
 
     companion object {
-        /** Builds a model from a whole log (sorted and deduplicated first). */
+        /** Builds a model from a whole log (sorted, deduplicated and replaced events dropped first). */
         fun build(events: Iterable<Event>, config: RecsConfig = RecsConfig()): TasteModel {
             val model = TasteModel(config)
-            for (e in EventLog.canonical(events)) model.apply(e)
+            for (e in EventLog.effective(events)) model.apply(e)
             return model
         }
     }

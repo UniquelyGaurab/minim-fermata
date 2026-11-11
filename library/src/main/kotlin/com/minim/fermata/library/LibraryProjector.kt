@@ -182,7 +182,7 @@ object LibraryProjection {
     /** Builds the library from a whole log, in any order: it is sorted and deduplicated first. */
     fun build(events: Iterable<Event>, countedPlayMs: Long = LibraryProjector.DEFAULT_COUNTED_PLAY_MS): LibraryState {
         val projector = LibraryProjector(countedPlayMs)
-        for (e in EventLog.canonical(events)) projector.apply(e)
+        for (e in EventLog.effective(events)) projector.apply(e)
         return projector.snapshot()
     }
 }

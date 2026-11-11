@@ -64,6 +64,24 @@ class FermataTest {
     }
 
     @Test
+    fun `a skip of the track just played keeps that play's previous track, as 5_9_0 rows do`() {
+        val clock = ManualClock(T0)
+        val f = fermata("dev", clock)
+        f.record(EventBody.Play(a, 120_000))
+        clock.now += 3 * MINUTE
+        val playB = f.record(EventBody.Play(b, 4_000))
+        val skipB = f.record(EventBody.Skip(b, 4_000))
+        clock.now += 5_000
+        val playC = f.record(EventBody.Play(c, 100_000))
+        assertEquals("A", playB.ctx.previousTrackId)
+        assertEquals("A", skipB.ctx.previousTrackId)
+        assertEquals("B", playC.ctx.previousTrackId)
+        // Exactly 30 minutes of nothing starts a new session, as in Minim 5.9.0.
+        clock.now += 30 * MINUTE
+        assertNotEquals(playC.ctx.sessionId, f.record(EventBody.Play(a, 100_000)).ctx.sessionId)
+    }
+
+    @Test
     fun `the library and taste follow recorded events`() {
         val clock = ManualClock(T0)
         val f = fermata("dev", clock)

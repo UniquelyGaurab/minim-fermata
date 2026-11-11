@@ -47,6 +47,7 @@ object EventCodec {
         event.ctx.sessionId?.let { put("session", it) }
         event.ctx.previousTrackId?.let { put("prev", it) }
         put("source", event.ctx.source.key)
+        event.ctx.replaces?.let { put("replaces", it.toString()) }
         put("type", event.body.type)
         put("data", bodyToJson(event.body))
     }
@@ -59,6 +60,7 @@ object EventCodec {
             sessionId = o.strOrNull("session"),
             previousTrackId = o.strOrNull("prev"),
             source = Source.fromKey(o.strOrNull("source")),
+            replaces = o.strOrNull("replaces")?.let { runCatching { EventId.parse(it) }.getOrNull() },
         )
         val type = o.str("type")
         val data = o["data"]?.jsonObject ?: JsonObject(emptyMap())

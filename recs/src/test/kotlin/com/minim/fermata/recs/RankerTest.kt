@@ -23,6 +23,16 @@ class RankerTest {
     }
 
     @Test
+    fun `a play with nothing heard teaches nothing`() {
+        val model = TasteModel.build(history(EventBody.Play(track("1"), 0)))
+        assertEquals(0L, model.signals)
+        assertEquals(0.0, model.trackScore("1", T0))
+        // A short listen followed by a skip nets out negative.
+        val skipped = TasteModel.build(history(EventBody.Play(track("2"), 3_000), EventBody.Skip(track("2"), 3_000)))
+        assertTrue(skipped.trackScore("2", T0 + MINUTE) < 0)
+    }
+
+    @Test
     fun `zero confidence returns the input order untouched`() {
         val empty = TasteModel()
         assertEquals(0.0, empty.confidence())

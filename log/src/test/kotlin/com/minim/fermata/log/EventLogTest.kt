@@ -32,6 +32,24 @@ class EventLogTest {
     private val c = randomLog("cccc", 3)
 
     @Test
+    fun `effective drops replaced events whatever order they arrive in`() {
+        val old = Event(EventId.legacy("play|x"), EventContext.at(T0), EventBody.Play(track("A"), 40_000))
+        val other = Event(EventId("dev", 2), EventContext.at(T0 + MINUTE), EventBody.Play(track("B"), 40_000))
+        val replacing = Event(
+            EventId("dev", 1),
+            EventContext.at(T0 - 30_000, replaces = old.id),
+            EventBody.Play(track("A"), 45_000),
+        )
+        val expected = listOf(replacing, other)
+        assertEquals(expected, EventLog.effective(listOf(old, other, replacing)))
+        assertEquals(expected, EventLog.effective(listOf(replacing, old, other, old)))
+        // The replaced event stays in the log itself: merges are still a plain union.
+        assertEquals(3, EventLog.merge(listOf(old), listOf(replacing, other)).size)
+        // Without the replacing event, the old one counts.
+        assertEquals(listOf(old, other), EventLog.effective(listOf(other, old)))
+    }
+
+    @Test
     fun `merge is commutative`() {
         assertEquals(EventLog.merge(a, b), EventLog.merge(b, a))
         assertEquals(EventLog.merge(a, b, c), EventLog.merge(c, a, b))

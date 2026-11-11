@@ -87,6 +87,14 @@ data class EventContext(
     val sessionId: String? = null,
     val previousTrackId: String? = null,
     val source: Source = Source.UNKNOWN,
+    /**
+     * The id of an older record of the same thing that this event stands in for, or null. Used
+     * when history is imported twice from different tables: a play from Minim 5.9.0's
+     * `fermata_events` replaces the legacy event for the same play in the old `plays` table, so
+     * that play counts once wherever the legacy copy turns up (another phone, the Firestore copy).
+     * Both stay in the log; projections skip the replaced one (see [EventLog.effective]).
+     */
+    val replaces: EventId? = null,
 ) {
     init {
         require(hour in 0..23) { "hour must be 0..23, got $hour" }
@@ -105,9 +113,10 @@ data class EventContext(
             previousTrackId: String? = null,
             source: Source = Source.UNKNOWN,
             wallTime: Long = timestamp,
+            replaces: EventId? = null,
         ): EventContext {
             val local = Instant.ofEpochMilli(wallTime).atZone(zone)
-            return EventContext(timestamp, local.hour, local.dayOfWeek.value, sessionId, previousTrackId, source)
+            return EventContext(timestamp, local.hour, local.dayOfWeek.value, sessionId, previousTrackId, source, replaces)
         }
     }
 }

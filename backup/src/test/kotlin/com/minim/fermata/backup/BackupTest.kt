@@ -56,6 +56,12 @@ class BackupTest {
             d.event(next(), EventBody.TasteEdit(TasteEditKind.JUST_A_PHASE, Subject.Track(full))),
             d.event(next(), EventBody.Unknown("future_thing", """{"x":1,"nested":{"y":[1,2,"z"]}}""")),
             Event(EventId.legacy("play|old-1"), EventContext.at(T0 - MINUTE, source = Source.IMPORT), EventBody.Play(full, 60_000)),
+            // A 5.9.0 play that stands in for the legacy copy of the same play.
+            Event(
+                EventId("3f9a0c5e1b7d2468", 21),
+                EventContext(T0 - 2 * MINUTE, 19, 3, "2b1c7e0a-5d3f-4c1e-9a8b-0f6e5d4c3b2a", null, Source.UNKNOWN, EventId.legacy("play|old-1")),
+                EventBody.Play(full, 61_000),
+            ),
         )
     }
 
@@ -106,7 +112,7 @@ class BackupTest {
             assertEquals(FermataInfo.VERSION, fermataVersion)
             assertEquals("6.0.0", appVersion)
             assertEquals(events.size.toLong(), eventCount)
-            assertEquals(mapOf("3f9a0c5e1b7d2468" to 20L), heads)
+            assertEquals(mapOf("3f9a0c5e1b7d2468" to 21L), heads)
             assertEquals(listOf(BackupArchive.EVENTS), files.map { it.name })
         }
         val names = zipEntries(out.toByteArray()).keys

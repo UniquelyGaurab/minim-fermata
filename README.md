@@ -33,7 +33,7 @@ A fermata is the music symbol that says "hold this note longer".
 | `recs` | `TasteModel` (decayed track and artist scores, confidence), `Ranker` (confidence blend, reasons) | No |
 | `backup` | The `.minim` format: `BackupArchive`, `Manifest`, JSON Lines `EventCodec` | No |
 | `core` | The `Fermata` facade: `record`, `library`, `rank`, `taste`, `export`, `import`, `merge` | No |
-| `android` | `SqliteEventStore`, SAF backup helpers and `BackupWorker` (stub), minSdk 28 | Yes |
+| `android` | `SqliteEventStore`, `MinimDatabaseReader` (reads Minim's tables for `importMinim`), SAF backup helpers and `BackupWorker` (stub), minSdk 28 | Yes |
 | `sample` | A tiny JVM walk-through | No |
 
 The pure modules have zero Android imports and target JVM 17 bytecode. An app that only wants recommendations can depend on `recs` alone and feed it its own events.
@@ -49,6 +49,7 @@ val picks = fermata.rank(radioCandidates)  // Pick(track, score, reason)
 
 fermata.export(outputStream)               // a .minim backup
 fermata.import(inputStream)                // merge a backup in (safe to repeat)
+fermata.importMinim(MinimDatabaseReader.read(db)) // Minim 5.9.0 fermata_events + old tables, once
 ```
 
 Create the device id once per install with `DeviceIds.random()` and keep it.

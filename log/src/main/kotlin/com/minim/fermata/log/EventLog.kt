@@ -15,6 +15,18 @@ object EventLog {
     /** Sorts into canonical order and drops duplicate ids. */
     fun canonical(events: Iterable<Event>): List<Event> = events.sortedWith(canonical).distinctBy { it.id }
 
+    /**
+     * What projections replay: [canonical], minus every event whose id another event names in
+     * [EventContext.replaces]. The replaced events stay in the log (merges stay a plain union);
+     * they are only left out of the library, stats and taste. Order-independent, so every device
+     * that holds the same events agrees on what counts.
+     */
+    fun effective(events: Iterable<Event>): List<Event> {
+        val log = canonical(events)
+        val replaced = log.mapNotNullTo(HashSet()) { it.ctx.replaces }
+        return if (replaced.isEmpty()) log else log.filter { it.id !in replaced }
+    }
+
     /** The highest counter seen per device (a version vector). The legacy pseudo-device is left out. */
     fun heads(events: Iterable<Event>): Map<String, Long> {
         val heads = HashMap<String, Long>()

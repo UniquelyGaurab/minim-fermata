@@ -18,6 +18,7 @@ The first draft made Fermata a recommendation engine next to Minim's library and
 - Backups and multi-phone sync both go through a folder the user picks with the Storage Access Framework. No account.
 - Removing Firebase also removes the built-in Gemini route (Firebase AI Logic + App Check). Bring-your-own AI Studio key stays, and the key is never written to a backup.
 - The code is split into modules (log, library, recs, backup) so another app can use only the recommendation side.
+- Minim 5.9.0 (the prep release) shipped the `fermata_events` table, and Fermata now imports it: those rows keep their own ids, and a play that is in both that table and the old `plays` table counts once (see [Importing Minim's old tables](#importing-minims-old-tables)).
 
 ## Principles
 
@@ -71,7 +72,11 @@ An append-only list of what happened. Never edited, only added to (and compacted
 
 A replay is not its own event: it is a `play` whose previous plays in the same session include the same track, which the model can see.
 
-Every event carries its context: **timestamp, hour, day of week, session id, previous track id and source** (radio, search, library, playlist, discover, tape, queue, import). Session order is what lets Fermata learn "after A, you usually keep B".
+Every event carries its context: **timestamp, hour, day of week, session id, previous track id and source** (radio, search, library, playlist, discover, tape, queue, import, unknown). Session order is what lets Fermata learn "after A, you usually keep B".
+
+**Session ids are opaque strings.** Fermata only compares them for equality and never parses them. When Fermata keeps the session itself it makes ids like `3f9a0c5e1b7d2468.40` (device id plus the counter of the event that opened the session), but Minim 5.9.0 wrote random UUIDs, and those are imported as they are. A new session starts after 30 minutes or more of nothing playing, the same rule 5.9.0 used.
+
+A skip is its own event next to the play: when you move on from a song, the log gets a `play` with the time heard (possibly a few seconds) and a `skip` with where you left it. The skip has the same previous track as the play it ends. A `play` with 0 ms heard is valid. It tells Fermata the track was there, but it teaches the taste model nothing.
 
 An event type the running version does not know (written by a newer version on another phone) is kept verbatim and passed on, never dropped.
 
@@ -79,14 +84,18 @@ An event type the running version does not know (written by a newer version on a
 
 Every event has a unique id: **`<device id>:<counter>`**. The device id is 16 random hex characters made once per install (never derived from hardware or an account); the counter starts at 1 and goes up by one per event on that device. Two devices can never write the same id.
 
-History imported from Minim's old tables or from the Firestore copy uses the pseudo-device `legacy` with a counter hashed from a stable key (for example `play|<old row id>` or `like|<track id>`). Two phones importing the same synced history produce the same ids, so a later merge does not count anything twice.
+Rows from Minim 5.9.0's `fermata_events` table are already real events: each becomes **`<device_id>:<row id>`**. The row id is the table's `AUTOINCREMENT` key, so it is never reused, and the device id is the 16-character id 5.9.0 stored on every row. A database restored onto a new phone keeps the old phone's id on its old rows, and the new phone's rows get the new id.
+
+History imported from Minim's old tables or from the Firestore copy uses the pseudo-device `legacy` with a counter hashed from a stable key (for example `play|<event_id>`, `tape|<video id>|<played at>` or `like|<track id>`). The keys use values that are the same on every phone. A play's `event_id` is the sync id Minim gives each play, and Firestore carries it too. A row id would not work, because it differs from phone to phone. Two phones importing the same synced history produce the same ids, so a later merge does not count anything twice.
+
+**Replaced events.** An event can name an older event it stands in for (`replaces` in its context, `"replaces"` in JSON Lines). Both stay in the log, so merges are still a plain union. Projections and the taste model skip the replaced one (`EventLog.effective`). That is how a 5.9.0 play and the legacy copy of the same play count once, on every phone and in whatever order they meet.
 
 ### Merging and conflicts
 
 - **Merge = union of logs, deduplicated by id.** It is commutative, associative and idempotent: phones converge whatever order they exchange events in, and receiving the same events twice changes nothing.
 - **Canonical order:** timestamp, then device id, then counter. Every projection replays events in this order.
 - **Conflicts resolve last-writer-wins** because of that order: if one phone likes a song and another unlikes it, the later one wins; on an exact timestamp tie, the event from the device id that sorts last wins. Every phone computes the same result.
-- **Clock rule:** a new event's timestamp is never earlier than the newest event already in the local log (+1 ms). So an action taken after seeing another phone's event always sorts after it, even if this phone's clock is behind. Hour and day of week still come from the real wall clock.
+- **Clock rule:** a new event's timestamp is never earlier than the newest event already in the local log (+1 ms). So an action taken after seeing another phone's event always sorts after it, even if this phone's clock is behind. Hour and day of week still come from the real wall clock. Imported history (5.9.0 rows, old tables, the Firestore copy) keeps the plain phone-clock times it was written with, which is fine for history. **Once Minim writes through Fermata, every new event must go through `Fermata.record` so it follows this rule.** Minim must not stamp events itself with `System.currentTimeMillis()` the way 5.9.0 did.
 - **Version vectors:** the highest counter per device tells a peer what is new (`heads` / `after`), so a sync sends only the missing events.
 
 ### Library projection
@@ -151,6 +160,8 @@ One line looks like this:
 {"id":"3f9a0c5e1b7d2468:42","ts":1794405000000,"hour":19,"dow":3,"session":"3f9a0c5e1b7d2468.40","prev":"dQw4w9WgXcQ","source":"radio","type":"play","data":{"track":{"id":"kJQP7kiw5Fk","title":"Despacito","artist":"Luis Fonsi","durationMs":229000},"listenedMs":182000}}
 ```
 
+An imported 5.9.0 play that stands in for the legacy copy of the same play also carries `"replaces":"legacy:<n>"`, and its session is a UUID. Readers that do not know a field ignore it.
+
 JSON Lines rather than a raw database copy, because:
 
 - Android 9 ships SQLite 3.22, which has no `VACUUM INTO` for safe live copies
@@ -190,14 +201,29 @@ Today Minim uses Firebase for optional Google sign-in sync (Firestore) and for t
 
 ### Importing Minim's old tables
 
-When Fermata is first wired into Minim, the existing tables are imported as historical events with `legacy` ids:
+When Fermata is first wired into Minim, `Fermata.importMinim(MinimDatabaseReader.read(libraryDb))` imports Minim's history in one go (`MinimImport`, pure and deterministic, so running it twice or on two phones adds nothing):
 
-- `plays(id, track_id, played_at, listened_ms)` → `play` events (key `play|<id>`), metadata from `tracks`
+- **`fermata_events` (Minim 5.9.0, the richest history)** → one event per row, id `<device_id>:<id>`. Columns map straight across: `ts`, `hour`, `dow` (ISO, 1 = Monday), `session_id`, `prev_track_id` and `source` go into the context. `play` → `play` (listened ms), `skip` → `skip` (position ms), `queued` → `queued`, `tape_play` → `tape_play` (listened ms, `speed_pct`, 100 when missing). Titles, artists and durations the row lacks come from `tracks`. Rows are taken as they are:
+  - A `play` row's time is when the track **started**, and its heard time is the last save. 5.9.0 inserted the row at track start and updated it in place, so the row of a song playing when the app was killed is short by a few seconds at most.
+  - Each repeat-one loop has its own row and stays its own play.
+  - A source that is missing or not one of Fermata's keys is `unknown`. Artist pages, songs Gemini added and anything queued before 5.9.0 are already `unknown` in the table.
+  - Missing hour or weekday is worked out from `ts`. Empty session or previous-track values become null.
+  - A row without a device id gets a legacy id from its content. A row with no `ts`, a blank track id or an unknown type is skipped and counted in the result.
+- **`plays(id, track_id, played_at, listened_ms, event_id)`** → `play` events with legacy key `play|<event_id>` (rows without one get the id Minim would give them, `base36(played_at)_track_id`), metadata from `tracks`.
+- **No double counting.** Since 5.9.0, a play can be in both tables: the `fermata_events` row opened at track start, and the `plays` row written at the 30-second mark. A `play` row and an old play of the same track are the same play when the old play's time falls in the window when that row was open: from its start (less 5 seconds of slack) to the start of the next `play`/`tape_play` row from the same phone, capped at 12 hours. Within each track the earliest such old play is matched, one to one, so repeat-one loops pair up loop by loop. Only the 5.9.0 event is written. It gets `replaces = legacy("play|<event_id>")` and the larger of the two heard times (the old table may have saved a few seconds more before a kill). That legacy copy is then skipped wherever it turns up: another phone that only has the old table, or the Firestore copy. `tape_plays` pair with `tape_play` rows the same way (key `tape|<video_id>|<played_at>`). Old plays with no matching row (before 5.9.0, synced from another phone, or written while a row's insert failed) stay legacy plays.
 - `tracks.is_liked / liked_at` → `like` events at `liked_at`
 - `playlists` + `playlist_tracks` → `playlist_create` + `playlist_add` in `position` order. Minim's playlist names are unique, so the imported playlist id is derived from the name, and two phones importing the same playlist agree on it
 - `not_interested` → `not_interested` events at `added_at`
-- `tape_plays` → `tape_play` events
+- `tape_plays` → `tape_play` events (listened 30 s, the point at which Minim saved them), except those matched above
 - `listen_time` and `tape_listen_time` (hourly totals) are recomputed from plays where the plays cover the same period; older totals that have no plays behind them are kept as a one-off summary (to be designed in step 4)
+
+Rules for the integration release:
+
+- **The release that imports `fermata_events` also stops writing it**, and imports only after the 5.9.0 logger is gone. The import takes each row as it is when it runs, and a later update to the same row id would never be read again.
+- After the import, Fermata's counter for this device moves past the highest row id, so its own events never reuse a 5.9.0 id. This happens in `importMinim` and `merge`, and again on restart from the store's heads.
+- Old tables stay untouched for one release, so a rollback is possible.
+- Firestore plays brought down by the bridge release use the same `play|<event_id>` keys, so they land on the same legacy ids and are skipped where a 5.9.0 row replaced them.
+- Minim's "Clear listening history" empties `plays` and `tape_plays` but not `fermata_events` in 5.9.0. Until that is settled, an import would bring the cleared plays back from `fermata_events`.
 
 ## How it learns
 
@@ -244,13 +270,15 @@ fermata.export(out)                              // a .minim backup
 fermata.import(input)                            // merge a backup in
 fermata.merge(fermata2.eventsAfter(fermata.heads()))
 
-// One-off import of old data
-fermata.importLegacy(EventBody.Play(track, 90_000), playedAt, legacyKey = "play|$rowId")
+// One-off import of Minim's history (5.9.0 fermata_events + the old tables), safe to repeat
+fermata.importMinim(MinimDatabaseReader.read(libraryDb.readableDatabase))
+// or one old row at a time, with a stable key
+fermata.importLegacy(EventBody.Play(track, 90_000), playedAt, legacyKey = "play|$eventId")
 ```
 
 ## Build order
 
-1. **Minim prep release:** start logging skips, session id, previous track and source in Minim, so richer history is already waiting when Fermata ships.
+1. **Minim prep release:** start logging skips, session id, previous track and source in Minim, so richer history is already waiting when Fermata ships. *(Shipped in Minim 5.9.0 as the `fermata_events` table; Fermata's importer for it is in `core` (`MinimImport`) and `android` (`MinimDatabaseReader`).)*
 2. **Fermata core:** events, ids, merge, library projection, backup format, decayed taste scores and confidence, with JVM tests. *(First commit.)*
 3. **Fermata Android module:** SQLite event store, SAF daily backups and restore. *(SQLite store and a backup worker stub in the first commit.)*
 4. **Integrate into Minim:** Minim's tables become projections; the old tables are imported as historical events.
@@ -260,7 +288,8 @@ fermata.importLegacy(EventBody.Play(track, 90_000), playedAt, legacyKey = "play|
 
 ## Open questions
 
-- Should tapes feed the same taste model, or keep a separate one?
-- Should backups have an optional password (they hold listening history in a folder other apps, or a cloud provider, might read)?
+- Should tapes feed the same taste model, or keep a separate one? *Dev's leaning (not final): a separate one, so long podcasts don't steer song recommendations.*
+- Should backups have an optional password (they hold listening history in a folder other apps, or a cloud provider, might read)? *Dev's leaning (not final): yes, eventually, as an option.*
+- Should Minim's "Clear listening history" also empty `fermata_events` (and, later, the matching events in the log)? If it does, a plain `DELETE` keeps the row ids from being reused.
 - How long should a phone keep reading another phone's backups after it stops writing new ones (a lost or retired phone)?
 - Do settings (theme, audio quality, and so on) belong in the log or in a separate, secret-free settings file?
