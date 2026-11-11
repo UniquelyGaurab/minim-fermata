@@ -198,6 +198,12 @@ interface FermataHolder {
      * events from another phone's backup), so the app can refresh what it built from the log.
      */
     fun onFermataChanged() {}
+
+    /**
+     * Called by the daily job before it merges and backs up, so the app can first record anything
+     * it still holds back (Minim records some history changes in batches). Failures are ignored.
+     */
+    fun beforeBackup() {}
 }
 
 /**
@@ -208,6 +214,7 @@ interface FermataHolder {
 class BackupWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
     override fun doWork(): Result {
         val holder = applicationContext as? FermataHolder ?: return Result.failure()
+        runCatching { holder.beforeBackup() }
         val (merge, backup) = FermataBackups(applicationContext, holder.fermata, holder.appVersion).runScheduled()
         if (merge.eventsAdded > 0) runCatching { holder.onFermataChanged() }
         return when {

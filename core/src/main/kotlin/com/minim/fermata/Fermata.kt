@@ -61,7 +61,28 @@ class Fermata(
     /** A gap longer than this starts a new listening session. */
     private val sessionGapMs: Long = 30 * 60_000L,
 ) {
-    private val lock = Any()
+    private val lock = java.util.concurrent.locks.ReentrantLock()
+
+    /**
+     * Fermata's lock. An app that keeps the log inside its own database and opens its database
+     * transaction before calling [record] (so the event commits with its own rows) takes this
+     * lock first and releases it after its transaction ends, keeping one lock order (Fermata,
+     * then the database) for every caller. [transaction] does this for a block; this is for apps
+     * whose transactions do not fit in one block. Re-entrant. After a transaction that recorded
+     * events was rolled back, call [rolledBack].
+     */
+    val writeLock: java.util.concurrent.locks.Lock get() = lock
+
+    @OptIn(kotlin.contracts.ExperimentalContracts::class)
+    private inline fun <T> synchronized(@Suppress("UNUSED_PARAMETER") l: Any, block: () -> T): T {
+        kotlin.contracts.contract { callsInPlace(block, kotlin.contracts.InvocationKind.EXACTLY_ONCE) }
+        lock.lock()
+        try {
+            return block()
+        } finally {
+            lock.unlock()
+        }
+    }
     private var counter: Long = store.heads()[deviceId] ?: 0L
     private var lastTimestamp: Long = store.maxTimestamp() ?: Long.MIN_VALUE
     private var session: String? = null
@@ -276,14 +297,21 @@ class Fermata(
      * deadlock against a merge or restore running on a background thread. If [block] throws,
      * the in-memory projections are dropped so they are rebuilt from what the store really holds.
      */
+    /**
+     * Call after an app database transaction that recorded events was rolled back: the in-memory
+     * projections are dropped and rebuilt from what the store really holds. The counter and clock
+     * only ever move forward, so a rolled-back id is never reused.
+     */
+    fun rolledBack() = synchronized(lock) {
+        clearPointRead = false
+        invalidate()
+    }
+
     fun <T> transaction(block: () -> T): T = synchronized(lock) {
         try {
             block()
         } catch (t: Throwable) {
-            // The counter and clock only ever move forward, so they stay as they are; the clear
-            // point and projections are read again from the store.
-            clearPointRead = false
-            invalidate()
+            rolledBack()
             throw t
         }
     }
