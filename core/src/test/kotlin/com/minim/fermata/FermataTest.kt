@@ -264,4 +264,56 @@ class FermataTest {
         assertEquals(listOf("write", "merge"), order)
         assertEquals(2L, f.eventCount())
     }
+
+    @Test
+    fun writeLockHeldAcrossAnAppTransactionMakesAMergeWait() {
+        val f = fermata("p", ManualClock(T0))
+        val incoming = fermata("q", ManualClock(T0)).record(EventBody.Like(Subject.Track(c)))
+        val order = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val locked = java.util.concurrent.CountDownLatch(1)
+        val merger = Thread {
+            locked.await()
+            f.merge(listOf(incoming))
+            order += "merge"
+        }
+        merger.start()
+        // An app that opens its own transaction across several calls: lock, record, record, unlock.
+        f.writeLock.lock()
+        try {
+            locked.countDown()
+            f.record(EventBody.Like(Subject.Track(a)))
+            Thread.sleep(200)
+            // Re-entrant: transaction inside the held lock does not deadlock.
+            f.transaction { f.record(EventBody.Like(Subject.Track(b))) }
+            order += "write"
+        } finally {
+            f.writeLock.unlock()
+        }
+        merger.join(5_000)
+        assertFalse(merger.isAlive)
+        assertEquals(listOf("write", "merge"), order)
+        assertEquals(3L, f.eventCount())
+    }
+
+    @Test
+    fun rolledBackRebuildsFromTheStoreAndNeverReusesAnId() {
+        val store = InMemoryEventStore()
+        val f = fermata("p", ManualClock(T0), store)
+        f.record(EventBody.Like(Subject.Track(a)))
+        f.writeLock.lock()
+        val lost = try {
+            val e = f.record(EventBody.Like(Subject.Track(b)))
+            store.removeAll(listOf(e.id)) // the app's database rolled back
+            f.rolledBack()
+            e
+        } finally {
+            f.writeLock.unlock()
+        }
+        assertEquals(setOf("A"), f.library().likedTracks.map { it.track.id }.toSet())
+        assertEquals(1L, f.eventCount())
+        val next = f.record(EventBody.Like(Subject.Track(b)))
+        assertNotEquals(lost.id, next.id)
+        assertEquals(3L, next.id.counter)
+        assertEquals(setOf("A", "B"), f.library().likedTracks.map { it.track.id }.toSet())
+    }
 }

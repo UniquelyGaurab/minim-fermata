@@ -54,6 +54,8 @@ class TestApp : Application(), FermataHolder {
     lateinit var holder: Fermata
     override val fermata: Fermata get() = holder
     override val appVersion: String = "5.10.0-test"
+    var onBeforeBackup: () -> Unit = {}
+    override fun beforeBackup() = onBeforeBackup()
 }
 
 private class StepClock(var now: Long) : Clock() {
@@ -397,5 +399,42 @@ class FermataBackupsTest {
             z.putNextEntry(ZipEntry("manifest.json")); z.write(manifest.toByteArray()); z.closeEntry()
             z.putNextEntry(ZipEntry("fermata-events.jsonl.gz")); z.write(gz); z.closeEntry()
         }
+    }
+
+    @Test
+    fun dailyJobLetsTheAppRecordHeldBackHistoryBeforeBackingUp() {
+        val (f, _) = phone("phoneA")
+        f.plays(a)
+        val app = context as TestApp
+        app.holder = f
+        FermataBackups(context, f).setFolder(TestDocumentsProvider.tree)
+        var calls = 0
+        // Minim saves plays still in progress here; the backup must already include them.
+        app.onBeforeBackup = { calls++; f.plays(b) }
+        try {
+            assertEquals(ListenableWorker.Result.success(), TestListenableWorkerBuilder<BackupWorker>(context).build().doWork())
+        } finally {
+            app.onBeforeBackup = {}
+        }
+        assertEquals(1, calls)
+        assertEquals(2L, read("minim-phoneA-latest.minim").manifest.eventCount)
+    }
+
+    @Test
+    fun aFailingBeforeBackupDoesNotStopTheBackup() {
+        val (f, _) = phone("phoneA")
+        f.plays(a, b)
+        val app = context as TestApp
+        app.holder = f
+        val backups = FermataBackups(context, f)
+        backups.setFolder(TestDocumentsProvider.tree)
+        app.onBeforeBackup = { error("app not ready") }
+        try {
+            assertEquals(ListenableWorker.Result.success(), TestListenableWorkerBuilder<BackupWorker>(context).build().doWork())
+        } finally {
+            app.onBeforeBackup = {}
+        }
+        assertTrue(backups.status().ok)
+        assertEquals(2L, read("minim-phoneA-latest.minim").manifest.eventCount)
     }
 }
