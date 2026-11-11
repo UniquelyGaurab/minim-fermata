@@ -50,6 +50,8 @@ data class LegacyPlayRow(
     val listenedMs: Long = 0,
     /** Sync id, `base36(played_at)_trackId`; the same on every phone the play synced to. */
     val eventId: String? = null,
+    /** Minim's `plays.tracked`: false for plays from before 4.9.0, whose time was never measured. */
+    val tracked: Boolean = true,
 )
 
 /** One row of Minim's old `tape_plays` table (a tape that passed 30 s heard). */
@@ -61,6 +63,7 @@ data class LegacyTapePlayRow(
     val thumbnailUrl: String = "",
     val durationSec: Long = 0,
     val playedAt: Long,
+    val channelId: String = "",
 )
 
 /** Display metadata from Minim's `tracks` table, used to fill in what a row does not carry. */
@@ -70,6 +73,7 @@ data class LegacyTrackRow(
     val artist: String = "",
     val durationSec: Long = 0,
     val thumbnailUrl: String = "",
+    val sourceUrl: String = "",
 )
 
 /** What Minim reads out of its database for [MinimImport]. */
@@ -149,19 +153,29 @@ object MinimImport {
             val body: EventBody = when (r.type) {
                 EventBody.PLAY -> {
                     var heard = (r.listenedMs ?: 0L).coerceAtLeast(0L)
-                    playMatch[r]?.let { old ->
+                    val old = playMatch[r]
+                    if (old != null) {
                         replaces = playId(old)
                         heard = maxOf(heard, old.listenedMs)
                     }
-                    EventBody.Play(track, heard)
+                    // The old row's time and sync id travel with the play, so stats built from
+                    // the log count it on the same day and hour as before.
+                    EventBody.Play(track, heard, countedAt = old?.playedAt, syncId = old?.eventId?.takeIf { it.isNotBlank() }, estimated = old?.tracked == false)
                 }
                 EventBody.TAPE_PLAY -> {
                     var heard = (r.listenedMs ?: 0L).coerceAtLeast(0L)
-                    tapeMatch[r]?.let { old ->
+                    val old = tapeMatch[r]
+                    if (old != null) {
                         replaces = tapeId(old)
                         heard = maxOf(heard, LEGACY_TAPE_LISTENED_MS)
                     }
-                    EventBody.TapePlay(track, heard, r.speedPct?.takeIf { it > 0 } ?: 100)
+                    val tape = if (old == null) track else track.copy(
+                        title = track.title.ifBlank { old.title },
+                        artist = track.artist.ifBlank { old.channel },
+                        thumbnailUrl = track.thumbnailUrl.ifBlank { old.thumbnailUrl },
+                        durationMs = if (track.durationMs > 0) track.durationMs else old.durationSec.coerceAtLeast(0L) * 1000,
+                    )
+                    EventBody.TapePlay(tape, heard, r.speedPct?.takeIf { it > 0 } ?: 100, countedAt = old?.playedAt, channelId = old?.channelId.orEmpty())
                 }
                 EventBody.SKIP -> EventBody.Skip(track, (r.positionMs ?: 0L).coerceAtLeast(0L))
                 else -> EventBody.Queued(track)
@@ -177,10 +191,10 @@ object MinimImport {
             val m = meta[p.trackId]
             val track = TrackRef(
                 p.trackId, m?.title.orEmpty(), m?.artist.orEmpty(),
-                (m?.durationSec ?: 0L).coerceAtLeast(0L) * 1000, m?.thumbnailUrl.orEmpty(),
+                (m?.durationSec ?: 0L).coerceAtLeast(0L) * 1000, m?.thumbnailUrl.orEmpty(), m?.sourceUrl.orEmpty(),
             )
             events.add(
-                Event(playId(p), EventContext.at(p.playedAt, zone, source = Source.IMPORT), EventBody.Play(track, p.listenedMs.coerceAtLeast(0L))),
+                Event(playId(p), EventContext.at(p.playedAt, zone, source = Source.IMPORT), EventBody.Play(track, p.listenedMs.coerceAtLeast(0L), countedAt = p.playedAt, syncId = p.eventId?.takeIf { it.isNotBlank() }, estimated = !p.tracked)),
             )
             legacyCount++
         }
@@ -188,7 +202,7 @@ object MinimImport {
             if (t in claimedTapes) continue
             val tape = TrackRef(t.videoId, t.title, t.channel, t.durationSec.coerceAtLeast(0L) * 1000, t.thumbnailUrl)
             events.add(
-                Event(tapeId(t), EventContext.at(t.playedAt, zone, source = Source.IMPORT), EventBody.TapePlay(tape, LEGACY_TAPE_LISTENED_MS)),
+                Event(tapeId(t), EventContext.at(t.playedAt, zone, source = Source.IMPORT), EventBody.TapePlay(tape, LEGACY_TAPE_LISTENED_MS, countedAt = t.playedAt, channelId = t.channelId)),
             )
             legacyCount++
         }
@@ -242,6 +256,7 @@ object MinimImport {
             r.artist?.takeIf { it.isNotBlank() } ?: m?.artist.orEmpty(),
             duration,
             m?.thumbnailUrl.orEmpty(),
+            m?.sourceUrl.orEmpty(),
         )
     }
 

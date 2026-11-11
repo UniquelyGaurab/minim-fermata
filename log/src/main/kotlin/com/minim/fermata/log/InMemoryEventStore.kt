@@ -34,5 +34,16 @@ class InMemoryEventStore(initial: Iterable<Event> = emptyList()) : EventStore {
 
     override fun heads(): Map<String, Long> = synchronized(lock) { HashMap(heads) }
 
+    /** Heads stay where they were: a counter once used is never handed out again. */
+    override fun removeAll(ids: Collection<EventId>): Int = synchronized(lock) {
+        var removed = 0
+        for (id in ids) {
+            val e = byId.remove(id) ?: continue
+            ordered.remove(e)
+            removed++
+        }
+        removed
+    }
+
     override fun maxTimestamp(): Long? = synchronized(lock) { if (ordered.isEmpty()) null else ordered.last().timestamp }
 }

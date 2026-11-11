@@ -72,6 +72,9 @@ class Fermata(
     private var projector: LibraryProjector? = null
     private var model: TasteModel? = null
     private var librarySnapshot: LibraryState? = null
+    /** The newest history clear point in the log; read from the store on first use. */
+    private var clearPoint: Long? = null
+    private var clearPointRead = false
 
     /**
      * Records something that just happened on this phone. When [sessionId] is null Fermata keeps
@@ -131,6 +134,8 @@ class Fermata(
     ): Event? = synchronized(lock) {
         val eventId = id ?: EventId(deviceId, counter + 1)
         val event = Event(eventId, EventContext.at(timestamp, zone, sessionId, previousTrackId, source), body)
+        // History from before a "clear listening history" never comes back, not even by import.
+        if (EventLog.isCleared(event, clearedBefore())) return null
         if (!store.append(event)) return null
         // An imported id of this device (a 5.9.0 row, say) moves the counter past it, so the
         // next record() never reuses it.
@@ -147,16 +152,66 @@ class Fermata(
     fun importLegacy(body: EventBody, timestamp: Long, legacyKey: String, source: Source = Source.IMPORT): Event? =
         recordAt(body, timestamp, source, id = EventId.legacy(legacyKey))
 
-    /** Merges events from elsewhere (another phone, a sync folder). Returns how many were new. */
-    fun merge(events: Iterable<Event>): Int = synchronized(lock) {
-        val added = store.appendAll(events)
-        if (added > 0) {
-            store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
-            // Events of this device that came back (its own rows imported, say) move the counter on.
-            store.heads()[deviceId]?.let { if (it > counter) counter = it }
-            invalidate()
+    /**
+     * Merges events from elsewhere (another phone, a sync folder). Returns how many were new.
+     * Listening history older than the newest history clear (this log's or one arriving with
+     * [events]) is left out, and when the clear is new here, the history it covers is deleted.
+     */
+    fun merge(events: Iterable<Event>): Int = mergeAs(events, ChangeOrigin.MERGE)
+
+    /**
+     * Adds events an app built from its own old data (legacy ids, see [EventId.legacy]) in one
+     * batch, with [merge]'s rules. Reported to listeners as [ChangeOrigin.IMPORT]. Safe to repeat.
+     */
+    fun importEvents(events: Iterable<Event>): Int = mergeAs(events, ChangeOrigin.IMPORT)
+
+    private fun mergeAs(events: Iterable<Event>, origin: ChangeOrigin): Int {
+        val change: Change
+        val added: Int
+        synchronized(lock) {
+            val incoming = events.toList()
+            val pruned = applyClears(incoming)
+            val local = clearedBefore()
+            val candidates = if (local == null) incoming else incoming.filterNot { EventLog.isCleared(it, local) }
+            val fresh = if (listeners.isEmpty()) emptyList() else candidates.filterNot { store.contains(it.id) }.distinctBy { it.id }
+            added = store.appendAll(candidates)
+            if (pruned) invalidate()
+            if (added > 0) {
+                store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
+                // Events of this device that came back (its own rows imported, say) move the counter on.
+                store.heads()[deviceId]?.let { if (it > counter) counter = it }
+                invalidate()
+            }
+            change = Change(origin, fresh, historyCleared = pruned)
         }
-        added
+        if (added > 0 || change.historyCleared) notify(change)
+        return added
+    }
+
+    /** Where a batch of new events came from; see [addListener]. */
+    enum class ChangeOrigin { MERGE, IMPORT, RESTORE }
+
+    /**
+     * Events that reached the log from outside the app's own [record] calls. [added] lists the
+     * events that were new (empty when no listener was registered at the time). [historyCleared]
+     * is true when a "clear listening history" from elsewhere deleted history here, so anything
+     * built from the log needs a full rebuild.
+     */
+    data class Change(val origin: ChangeOrigin, val added: List<Event>, val historyCleared: Boolean)
+
+    private val listeners = java.util.concurrent.CopyOnWriteArrayList<(Change) -> Unit>()
+
+    /**
+     * Calls [listener] after every merge, import or restore that changed the log (also from the
+     * background backup job), outside Fermata's lock. The app's own [record] calls are not
+     * reported: the app knows about them already.
+     */
+    fun addListener(listener: (Change) -> Unit) { listeners += listener }
+
+    fun removeListener(listener: (Change) -> Unit) { listeners -= listener }
+
+    private fun notify(change: Change) {
+        for (l in listeners) runCatching { l(change) }
     }
 
     /**
@@ -166,7 +221,7 @@ class Fermata(
      */
     fun importMinim(tables: MinimTables): MinimImportResult {
         val result = MinimImport.convert(tables, zone)
-        return result.copy(added = merge(result.events))
+        return result.copy(added = mergeAs(result.events, ChangeOrigin.IMPORT))
     }
 
     /**
@@ -180,7 +235,13 @@ class Fermata(
      * Restored events keep their own ids. This phone keeps [deviceId]; if the backup holds events
      * with this phone's id, the counter moves past the highest of them so no id is reused.
      */
-    fun restore(events: List<Event>): RestoreStats = synchronized(lock) {
+    fun restore(events: List<Event>): RestoreStats {
+        val stats = restoreLocked(events)
+        notify(Change(ChangeOrigin.RESTORE, emptyList(), historyCleared = true))
+        return stats
+    }
+
+    private fun restoreLocked(events: List<Event>): RestoreStats = synchronized(lock) {
         // Dry run: the same replay the rebuild below does, on the union, before writing anything.
         val dryRun = LibraryProjector(config.countedPlayMs)
         val dryModel = TasteModel(config)
@@ -189,12 +250,68 @@ class Fermata(
             dryModel.apply(e)
         }
         dryRun.snapshot()
-        val added = store.appendAll(events)
+        // A history clear on either side wins: this phone's clear is kept, and the backup's
+        // history from before it is not written back.
+        val point = listOfNotNull(clearedBefore(), EventLog.clearedBefore(events)).maxOrNull()
+        val added = store.appendAll(if (point == null) events else events.filterNot { EventLog.isCleared(it, point) })
+        applyClears(events)
         store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
         store.heads()[deviceId]?.let { if (it > counter) counter = it }
         invalidate()
         built()
         RestoreStats(added, events.size)
+    }
+
+    /**
+     * The timestamp an event recorded now would get under the clock rule (never earlier than
+     * the newest event + 1 ms), without recording anything. For times an app stores inside an
+     * event body, such as [EventBody.Play.countedAt].
+     */
+    fun timestamp(): Long = synchronized(lock) {
+        val wall = clock.millis()
+        if (lastTimestamp == Long.MIN_VALUE) wall else maxOf(wall, lastTimestamp + 1)
+    }
+
+    /**
+     * "Clear listening history": records a [EventBody.HistoryClear] covering everything before
+     * now and deletes the listening events it covers from the store. Every phone that merges or
+     * restores this event drops the same history, whichever order things arrive in. Likes,
+     * playlists and "not interested" stay.
+     */
+    fun clearHistory(): Event = synchronized(lock) {
+        val before = timestamp()
+        val event = record(EventBody.HistoryClear(before))
+        clearPoint = maxOf(clearPoint ?: before, before)
+        clearPointRead = true
+        store.removeHistoryBefore(before)
+        invalidate()
+        event
+    }
+
+    /** The newest history clear point in the log, or null when history was never cleared. */
+    fun clearedBefore(): Long? = synchronized(lock) {
+        if (!clearPointRead) {
+            clearPoint = store.clearedBefore()
+            clearPointRead = true
+        }
+        clearPoint
+    }
+
+    /**
+     * Deletes listening history covered by the newest clear point (the log's, or one in
+     * [incoming] that is newer). Safe to repeat; a no-op when nothing is covered. Returns true
+     * when the clear point moved or anything was deleted.
+     */
+    fun pruneCleared(): Boolean = synchronized(lock) { applyClears(emptyList()).also { if (it) invalidate() } }
+
+    private fun applyClears(incoming: List<Event>): Boolean {
+        val local = clearedBefore()
+        val arriving = EventLog.clearedBefore(incoming)
+        val point = listOfNotNull(local, arriving).maxOrNull() ?: return false
+        val moved = local == null || point > local
+        if (moved) clearPoint = point
+        val removed = store.removeHistoryBefore(point)
+        return moved || removed > 0
     }
 
     /** Drops the library and taste projections and replays the whole log now. */
@@ -238,6 +355,9 @@ class Fermata(
 
     /** Events a peer with version vector [heads] has not seen yet. */
     fun eventsAfter(heads: Map<String, Long>): List<Event> = store.after(heads)
+
+    /** Every stored event, in log order. */
+    fun events(): List<Event> = store.all()
 
     /** Writes a `.minim` backup of the whole log to [out] (not closed). */
     fun export(out: OutputStream, appVersion: String? = null): Manifest =

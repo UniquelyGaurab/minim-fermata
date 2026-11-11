@@ -24,8 +24,24 @@ object EventLog {
     fun effective(events: Iterable<Event>): List<Event> {
         val log = canonical(events)
         val replaced = log.mapNotNullTo(HashSet()) { it.ctx.replaces }
-        return if (replaced.isEmpty()) log else log.filter { it.id !in replaced }
+        val clearedBefore = clearedBefore(log)
+        if (replaced.isEmpty() && clearedBefore == null) return log
+        return log.filter { it.id !in replaced && !isCleared(it, clearedBefore) }
     }
+
+    /** The newest "clear listening history" point in [events], or null when there is none. */
+    fun clearedBefore(events: Iterable<Event>): Long? {
+        var best: Long? = null
+        for (e in events) {
+            val b = e.body as? EventBody.HistoryClear ?: continue
+            if (best == null || b.before > best) best = b.before
+        }
+        return best
+    }
+
+    /** Whether [event] is listening history from before the clear point [clearedBefore]. */
+    fun isCleared(event: Event, clearedBefore: Long?): Boolean =
+        clearedBefore != null && event.ctx.timestamp < clearedBefore && EventBody.isHistory(event.body.type)
 
     /** The highest counter seen per device (a version vector). The legacy pseudo-device is left out. */
     fun heads(events: Iterable<Event>): Map<String, Long> {

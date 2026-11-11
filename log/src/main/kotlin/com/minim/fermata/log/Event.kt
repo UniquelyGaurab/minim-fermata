@@ -31,6 +31,8 @@ data class TrackRef(
     val artist: String = "",
     val durationMs: Long = 0,
     val thumbnailUrl: String = "",
+    /** Where the app plays it from when that is not the plain YouTube id (Minim's `source_url`). */
+    val sourceUrl: String = "",
 ) {
     init {
         require(id.isNotBlank()) { "track id must not be blank" }
@@ -126,8 +128,21 @@ sealed interface EventBody {
     /** The stable type name written to the log. */
     val type: String
 
-    /** A song was played; [listenedMs] is the time actually heard. */
-    data class Play(val track: TrackRef, val listenedMs: Long) : EventBody {
+    /**
+     * A song was played; [listenedMs] is the time actually heard.
+     *
+     * [countedAt] is when the play counted as a play in the app's stats (Minim: 30 seconds in),
+     * or null when it never did. [syncId] is the id the app's own sync gave the play (Minim's
+     * `plays.event_id`). [estimated] marks old plays whose listening time was never measured
+     * (Minim's `plays.tracked = 0`). All three are optional; older logs simply lack them.
+     */
+    data class Play(
+        val track: TrackRef,
+        val listenedMs: Long,
+        val countedAt: Long? = null,
+        val syncId: String? = null,
+        val estimated: Boolean = false,
+    ) : EventBody {
         override val type: String get() = PLAY
     }
 
@@ -185,12 +200,29 @@ sealed interface EventBody {
     }
 
     /** A tape (a YouTube video in Minim's tapes) was played at [speedPercent]. */
-    data class TapePlay(val tape: TrackRef, val listenedMs: Long, val speedPercent: Int = 100) : EventBody {
+    /** [countedAt]: when it counted as a tape play (Minim's `tape_plays.played_at`), or null. */
+    data class TapePlay(
+        val tape: TrackRef,
+        val listenedMs: Long,
+        val speedPercent: Int = 100,
+        val countedAt: Long? = null,
+        val channelId: String = "",
+    ) : EventBody {
         override val type: String get() = TAPE_PLAY
     }
 
     data class TasteEdit(val kind: TasteEditKind, val subject: Subject) : EventBody {
         override val type: String get() = TASTE_EDIT
+    }
+
+    /**
+     * "Clear listening history": every listening event (see [isHistory]) with a timestamp before
+     * [before] no longer counts, on every phone, whichever order the events arrive in. Likes,
+     * playlists and "not interested" are not touched. Fermata also deletes the covered events
+     * from the store, so backups written after the clear no longer hold them.
+     */
+    data class HistoryClear(val before: Long) : EventBody {
+        override val type: String get() = HISTORY_CLEAR
     }
 
     /**
@@ -215,6 +247,19 @@ sealed interface EventBody {
         const val PLAYLIST_MOVE = "playlist_move"
         const val TAPE_PLAY = "tape_play"
         const val TASTE_EDIT = "taste_edit"
+        const val HISTORY_CLEAR = "history_clear"
+
+        /**
+         * App-defined types starting with this prefix are listening history too: Fermata carries
+         * them without reading them, and a [HistoryClear] removes them like plays. Minim uses
+         * `history.minim.*` for its time-heard-by-hour and play-count records.
+         */
+        const val APP_HISTORY_PREFIX = "history."
+
+        private val CORE_HISTORY = setOf(PLAY, SKIP, QUEUED, TAPE_PLAY)
+
+        /** Whether events of [type] are listening history, which a [HistoryClear] covers. */
+        fun isHistory(type: String): Boolean = type in CORE_HISTORY || type.startsWith(APP_HISTORY_PREFIX)
     }
 }
 

@@ -6,6 +6,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.minim.fermata.backup.EventCodec
 import com.minim.fermata.log.Event
+import com.minim.fermata.log.EventBody
 import com.minim.fermata.log.EventId
 import com.minim.fermata.log.EventStore
 
@@ -57,15 +58,21 @@ class SqliteEventStore(
     override fun count(): Long =
         db.rawQuery("SELECT COUNT(*) FROM $TABLE", null).use { c -> if (c.moveToFirst()) c.getLong(0) else 0L }
 
-    override fun heads(): Map<String, Long> =
+    /**
+     * The highest counter per device, including events deleted by a history clear (kept in
+     * [FLOORS]), so a counter is never handed out twice.
+     */
+    override fun heads(): Map<String, Long> {
+        val heads = HashMap<String, Long>()
         db.rawQuery(
             "SELECT device, MAX(counter) FROM $TABLE WHERE device != ? GROUP BY device",
             arrayOf(EventId.LEGACY_DEVICE),
-        ).use { c ->
-            val heads = HashMap<String, Long>()
-            while (c.moveToNext()) heads[c.getString(0)] = c.getLong(1)
-            heads
+        ).use { c -> while (c.moveToNext()) heads[c.getString(0)] = c.getLong(1) }
+        db.rawQuery("SELECT device, counter FROM $FLOORS", null).use { c ->
+            while (c.moveToNext()) heads.merge(c.getString(0), c.getLong(1)) { a, b -> maxOf(a, b) }
         }
+        return heads
+    }
 
     override fun maxTimestamp(): Long? =
         db.rawQuery("SELECT MAX(ts) FROM $TABLE", null).use { c ->
@@ -97,6 +104,62 @@ class SqliteEventStore(
             events
         }
     }
+
+    override fun removeAll(ids: Collection<EventId>): Int {
+        val database = db
+        var removed = 0
+        database.beginTransaction()
+        try {
+            keepHeads(database)
+            for (id in ids) removed += database.delete(TABLE, "id = ?", arrayOf(id.toString()))
+            database.setTransactionSuccessful()
+        } finally {
+            database.endTransaction()
+        }
+        return removed
+    }
+
+    override fun removeHistoryBefore(before: Long): Int {
+        val database = db
+        database.beginTransaction()
+        try {
+            keepHeads(database)
+            val removed = database.delete(
+                TABLE,
+                "ts < ? AND (type IN ('${EventBody.PLAY}', '${EventBody.SKIP}', '${EventBody.QUEUED}', '${EventBody.TAPE_PLAY}') OR type LIKE ?)",
+                arrayOf(before.toString(), EventBody.APP_HISTORY_PREFIX + "%"),
+            )
+            database.setTransactionSuccessful()
+            return removed
+        } finally {
+            database.endTransaction()
+        }
+    }
+
+    /** Saves the current heads before deleting, so they never move backwards. */
+    private fun keepHeads(database: SQLiteDatabase) {
+        // Plain INSERT OR IGNORE + UPDATE: UPSERT needs SQLite 3.24, newer than Android 9's.
+        database.execSQL(
+            "INSERT OR IGNORE INTO $FLOORS(device, counter) SELECT device, MAX(counter) FROM $TABLE WHERE device != ? GROUP BY device",
+            arrayOf(EventId.LEGACY_DEVICE),
+        )
+        database.execSQL(
+            """
+            UPDATE $FLOORS SET counter = (SELECT MAX(e.counter) FROM $TABLE e WHERE e.device = $FLOORS.device)
+            WHERE (SELECT MAX(e.counter) FROM $TABLE e WHERE e.device = $FLOORS.device) > counter
+            """.trimIndent(),
+        )
+    }
+
+    override fun clearedBefore(): Long? =
+        db.rawQuery("SELECT json FROM $TABLE WHERE type = ?", arrayOf(EventBody.HISTORY_CLEAR)).use { c ->
+            var best: Long? = null
+            while (c.moveToNext()) {
+                val b = runCatching { EventCodec.decode(c.getString(0)).body }.getOrNull() as? EventBody.HistoryClear ?: continue
+                if (best == null || b.before > best) best = b.before
+            }
+            best
+        }
 
     fun close() = helper.close()
 
@@ -133,16 +196,24 @@ class SqliteEventStore(
             db.execSQL("CREATE INDEX idx_events_order ON $TABLE(ts, device, counter)")
             db.execSQL("CREATE INDEX idx_events_device ON $TABLE(device, counter)")
             db.execSQL("CREATE INDEX idx_events_type ON $TABLE(type, ts)")
+            createFloors(db)
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            // Version 1 is the first schema. Never drop the log: migrate forward only.
+            // Never drop the log: migrate forward only.
+            if (oldVersion < 2) createFloors(db)
+        }
+
+        /** Version 2: the highest counter per device, kept when a history clear deletes events. */
+        private fun createFloors(db: SQLiteDatabase) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS $FLOORS (device TEXT PRIMARY KEY NOT NULL, counter INTEGER NOT NULL)")
         }
     }
 
     companion object {
         const val DEFAULT_NAME = "fermata.db"
         private const val TABLE = "events"
-        private const val VERSION = 1
+        private const val FLOORS = "head_floors"
+        private const val VERSION = 2
     }
 }

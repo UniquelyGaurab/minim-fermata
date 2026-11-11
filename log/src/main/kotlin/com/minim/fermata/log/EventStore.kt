@@ -30,6 +30,20 @@ interface EventStore {
     /** The newest timestamp stored, or null when the store is empty. */
     fun maxTimestamp(): Long?
 
+    /**
+     * Deletes the events with these ids; returns how many were there. Only "clear listening
+     * history" deletes anything (see [removeHistoryBefore]); the log is otherwise append-only.
+     */
+    fun removeAll(ids: Collection<EventId>): Int =
+        throw UnsupportedOperationException("${this::class.simpleName} cannot delete events")
+
+    /** Deletes the listening events ([EventBody.isHistory]) older than [before]; returns how many. */
+    fun removeHistoryBefore(before: Long): Int =
+        removeAll(all().filter { EventLog.isCleared(it, before) }.map { it.id })
+
+    /** The newest [EventBody.HistoryClear] point stored, or null. */
+    fun clearedBefore(): Long? = EventLog.clearedBefore(all())
+
     /** Events a peer with version vector [heads] has not seen. */
     fun after(heads: Map<String, Long>): List<Event> = EventLog.after(all(), heads)
 }

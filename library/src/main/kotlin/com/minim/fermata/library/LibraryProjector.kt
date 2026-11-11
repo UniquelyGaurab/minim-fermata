@@ -46,6 +46,8 @@ class LibraryProjector(private val countedPlayMs: Long = DEFAULT_COUNTED_PLAY_MS
 
     /** Applies [event]. Returns false (and changes nothing) if it sorts before [lastApplied]. */
     fun apply(event: Event): Boolean {
+        // A history clear drops what came before it: the caller replays EventLog.effective instead.
+        if (event.body is EventBody.HistoryClear) return false
         val last = lastApplied
         if (last != null && Event.ORDER.compare(event, last) < 0) return false
         if (last != null && last.id == event.id) return true
@@ -125,6 +127,7 @@ class LibraryProjector(private val countedPlayMs: Long = DEFAULT_COUNTED_PLAY_MS
             }
             is EventBody.TapePlay -> tapeHistory.add(TapeRecord(b.tape, t, b.listenedMs, b.speedPercent))
             is EventBody.TasteEdit -> Unit // taste only, the library is unchanged
+            is EventBody.HistoryClear -> Unit // handled above
             is EventBody.Unknown -> Unit
         }
         return true

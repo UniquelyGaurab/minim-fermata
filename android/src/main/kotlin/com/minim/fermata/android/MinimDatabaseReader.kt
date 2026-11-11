@@ -69,6 +69,8 @@ object MinimDatabaseReader {
                         playedAt = c.long("played_at") ?: continue,
                         listenedMs = c.long("listened_ms") ?: 0L,
                         eventId = c.str("event_id"),
+                        // No column at all: a database from before 4.9.0, so nothing was measured.
+                        tracked = (c.int("tracked") ?: 0) == 1,
                     ),
                 )
             }
@@ -90,6 +92,7 @@ object MinimDatabaseReader {
                         thumbnailUrl = c.str("thumbnail_url").orEmpty(),
                         durationSec = c.long("duration_sec") ?: 0L,
                         playedAt = c.long("played_at") ?: continue,
+                        channelId = c.str("channel_id").orEmpty(),
                     ),
                 )
             }
@@ -110,6 +113,7 @@ object MinimDatabaseReader {
                         artist = c.str("artist").orEmpty(),
                         durationSec = c.long("duration_sec") ?: 0L,
                         thumbnailUrl = c.str("thumbnail_url").orEmpty(),
+                        sourceUrl = c.str("source_url").orEmpty(),
                     ),
                 )
             }

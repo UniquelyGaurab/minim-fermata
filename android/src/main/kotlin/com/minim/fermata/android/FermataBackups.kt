@@ -94,7 +94,7 @@ class FermataBackups(
     // --- Backup ---
 
     /** Backs up now, blocking until it is done. The result is also kept for [status]. */
-    fun backUpNow(): BackupResult = core.backUp(backupFolder())
+    fun backUpNow(replacePrevious: Boolean = false): BackupResult = core.backUp(backupFolder(), replacePrevious)
 
     /**
      * "Back up now" as background work: merges the other phones' backups, then backs up, even if
@@ -192,6 +192,12 @@ class FermataBackups(
 interface FermataHolder {
     val fermata: Fermata
     val appVersion: String?
+
+    /**
+     * Called after background work changed the log behind the app's back (the daily job merged
+     * events from another phone's backup), so the app can refresh what it built from the log.
+     */
+    fun onFermataChanged() {}
 }
 
 /**
@@ -202,7 +208,8 @@ interface FermataHolder {
 class BackupWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
     override fun doWork(): Result {
         val holder = applicationContext as? FermataHolder ?: return Result.failure()
-        val (_, backup) = FermataBackups(applicationContext, holder.fermata, holder.appVersion).runScheduled()
+        val (merge, backup) = FermataBackups(applicationContext, holder.fermata, holder.appVersion).runScheduled()
+        if (merge.eventsAdded > 0) runCatching { holder.onFermataChanged() }
         return when {
             backup is BackupResult.Success -> Result.success()
             backup is BackupResult.Failure && backup.error in NOT_RETRIED -> Result.success()

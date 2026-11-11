@@ -19,6 +19,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
@@ -73,7 +74,12 @@ object EventCodec {
         is EventBody.Unknown -> Json.parseToJsonElement(body.json).jsonObject
         else -> buildJsonObject {
             when (body) {
-                is EventBody.Play -> { put("track", track(body.track)); put("listenedMs", body.listenedMs) }
+                is EventBody.Play -> {
+                    put("track", track(body.track)); put("listenedMs", body.listenedMs)
+                    body.countedAt?.let { put("countedAt", it) }
+                    body.syncId?.let { put("syncId", it) }
+                    if (body.estimated) put("estimated", true)
+                }
                 is EventBody.Skip -> { put("track", track(body.track)); put("positionMs", body.positionMs) }
                 is EventBody.Queued -> put("track", track(body.track))
                 is EventBody.Like -> subject(body.subject)
@@ -94,7 +100,10 @@ object EventCodec {
                 }
                 is EventBody.TapePlay -> {
                     put("tape", track(body.tape)); put("listenedMs", body.listenedMs); put("speed", body.speedPercent)
+                    body.countedAt?.let { put("countedAt", it) }
+                    if (body.channelId.isNotEmpty()) put("channelId", body.channelId)
                 }
+                is EventBody.HistoryClear -> put("before", body.before)
                 is EventBody.TasteEdit -> { put("kind", body.kind.key); subject(body.subject) }
                 is EventBody.Unknown -> error("handled above")
             }
@@ -102,7 +111,12 @@ object EventCodec {
     }
 
     private fun bodyFromJson(type: String, d: JsonObject): EventBody? = when (type) {
-        EventBody.PLAY -> EventBody.Play(d.track("track"), d.long("listenedMs"))
+        EventBody.PLAY -> EventBody.Play(
+            d.track("track"), d.long("listenedMs"),
+            countedAt = d["countedAt"]?.jsonPrimitive?.longOrNull,
+            syncId = d.strOrNull("syncId"),
+            estimated = d["estimated"]?.jsonPrimitive?.booleanOrNull ?: false,
+        )
         EventBody.SKIP -> EventBody.Skip(d.track("track"), d.long("positionMs"))
         EventBody.QUEUED -> EventBody.Queued(d.track("track"))
         EventBody.LIKE -> d.subject()?.let { EventBody.Like(it) }
@@ -115,7 +129,12 @@ object EventCodec {
         EventBody.PLAYLIST_ADD -> EventBody.PlaylistAdd(d.str("playlist"), d.track("track"), d["index"]?.jsonPrimitive?.intOrNull)
         EventBody.PLAYLIST_REMOVE -> EventBody.PlaylistRemove(d.str("playlist"), d.str("trackId"))
         EventBody.PLAYLIST_MOVE -> EventBody.PlaylistMove(d.str("playlist"), d.str("trackId"), d.int("toIndex"))
-        EventBody.TAPE_PLAY -> EventBody.TapePlay(d.track("tape"), d.long("listenedMs"), d["speed"]?.jsonPrimitive?.intOrNull ?: 100)
+        EventBody.TAPE_PLAY -> EventBody.TapePlay(
+            d.track("tape"), d.long("listenedMs"), d["speed"]?.jsonPrimitive?.intOrNull ?: 100,
+            countedAt = d["countedAt"]?.jsonPrimitive?.longOrNull,
+            channelId = d.strOrNull("channelId") ?: "",
+        )
+        EventBody.HISTORY_CLEAR -> EventBody.HistoryClear(d.long("before"))
         EventBody.TASTE_EDIT -> {
             val kind = TasteEditKind.fromKey(d.str("kind"))
             val subject = d.subject()
@@ -130,6 +149,7 @@ object EventCodec {
         if (t.artist.isNotEmpty()) put("artist", t.artist)
         if (t.durationMs != 0L) put("durationMs", t.durationMs)
         if (t.thumbnailUrl.isNotEmpty()) put("thumb", t.thumbnailUrl)
+        if (t.sourceUrl.isNotEmpty()) put("src", t.sourceUrl)
     }
 
     private fun JsonObjectBuilder.subject(s: Subject) {
@@ -153,6 +173,7 @@ object EventCodec {
             artist = t.strOrNull("artist") ?: "",
             durationMs = t["durationMs"]?.jsonPrimitive?.longOrNull ?: 0L,
             thumbnailUrl = t.strOrNull("thumb") ?: "",
+            sourceUrl = t.strOrNull("src") ?: "",
         )
     }
 

@@ -46,14 +46,21 @@ class FolderBackups(
 ) {
     private val deviceId: String get() = fermata.deviceId
 
-    /** Backs up the whole log into [folder] and records the result in [status]. */
-    fun backUp(folder: BackupFolder?): BackupResult = synchronized(LOCK) {
+    /**
+     * Backs up the whole log into [folder] and records the result in [status].
+     *
+     * With [replacePrevious] (used right after "clear listening history") the old latest is not
+     * kept as `previous`: `previous` becomes a second copy of the new backup, so none of this
+     * phone's files still holds the cleared history. If the copy fails, the old file is still
+     * deleted and only `latest` is left.
+     */
+    fun backUp(folder: BackupFolder?, replacePrevious: Boolean = false): BackupResult = synchronized(LOCK) {
         val now = clock.millis()
         val result = if (folder == null) {
             BackupResult.Failure(now, BackupError.NO_FOLDER, "No backup folder picked yet")
         } else {
             try {
-                writeBackup(folder, now)
+                writeBackup(folder, now, replacePrevious)
             } catch (e: SecurityException) {
                 BackupResult.Failure(now, BackupError.FOLDER_ACCESS_LOST, "Lost access to the backup folder: pick it again")
             } catch (e: Exception) {
@@ -204,7 +211,7 @@ class FolderBackups(
 
     // --- Backup steps ---
 
-    private fun writeBackup(folder: BackupFolder, now: Long): BackupResult {
+    private fun writeBackup(folder: BackupFolder, now: Long, replacePrevious: Boolean = false): BackupResult {
         val latestName = BackupNames.latest(deviceId)
         val previousName = BackupNames.previous(deviceId)
         val entries = folder.list()
@@ -247,6 +254,7 @@ class FolderBackups(
             }
             newFile = folder.rename(temp, latestName)
             check(newFile.name == latestName) { "the folder named the backup ${newFile.name}" }
+            if (replacePrevious) replacePreviousWith(folder, newFile, manifest, now, movedLatest ?: oldPrevious)
             return BackupResult.Success(now, newFile.name, manifest.eventCount, bytes)
         } catch (e: SecurityException) {
             throw e
@@ -257,6 +265,29 @@ class FolderBackups(
                 movedLatest?.let { runCatching { folder.rename(it, latestName) } }
             }
             return BackupResult.Failure(now, BackupError.RENAME_FAILED, "Couldn't move the new backup into place (${describe(e)}); the old one is kept")
+        }
+    }
+
+    /**
+     * Deletes [old] (the file that would have stayed as `previous`) and writes a checked copy of
+     * [latest] as `previous`. Best effort: a failed copy leaves just `latest`, never the old file.
+     */
+    private fun replacePreviousWith(folder: BackupFolder, latest: FolderEntry, manifest: Manifest, now: Long, old: FolderEntry?) {
+        val previousName = BackupNames.previous(deviceId)
+        if (old != null) folder.delete(old)
+        folder.list().filter { it.name == previousName }.forEach { runCatching { folder.delete(it) } }
+        val temp = folder.create(BackupNames.temp(deviceId, "$now-${nonce()}"))
+        try {
+            folder.openInput(latest).use { input -> folder.openOutput(temp).use { out -> input.copyTo(out) } }
+            if (verify(folder, temp, manifest) != null) {
+                runCatching { folder.delete(temp) }
+                return
+            }
+            folder.rename(temp, previousName)
+        } catch (e: SecurityException) {
+            throw e
+        } catch (e: Exception) {
+            runCatching { folder.delete(temp) }
         }
     }
 
