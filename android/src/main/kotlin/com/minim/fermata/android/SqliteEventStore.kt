@@ -100,6 +100,9 @@ class SqliteEventStore(
 
     fun close() = helper.close()
 
+    /** For tests that need to make the database fail part way. */
+    internal fun database(): SQLiteDatabase = db
+
     private fun values(e: Event) = ContentValues().apply {
         put("id", e.id.toString())
         put("device", e.id.device)

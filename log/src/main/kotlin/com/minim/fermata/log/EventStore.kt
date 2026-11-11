@@ -11,7 +11,10 @@ interface EventStore {
     /** Stores [event] unless its id is already present. Returns true when it was new. */
     fun append(event: Event): Boolean
 
-    /** Stores every new event; returns how many were new. */
+    /**
+     * Stores every new event; returns how many were new. Stores that persist must do this all or
+     * nothing (one transaction): restore and merge rely on a failure leaving the log unchanged.
+     */
     fun appendAll(events: Iterable<Event>): Int = events.count { append(it) }
 
     /** Every event, in canonical [Event.ORDER]. */

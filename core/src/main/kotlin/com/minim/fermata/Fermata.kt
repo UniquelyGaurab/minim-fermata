@@ -32,6 +32,9 @@ data class TasteView(val topTracks: List<ScoredTrack>, val topArtists: List<Scor
 
 data class ImportResult(val manifest: Manifest, val added: Int, val total: Int)
 
+/** What [Fermata.restore] did: [added] of the [total] events were new to this log. */
+data class RestoreStats(val added: Int, val total: Int)
+
 /**
  * Minim's on-device storage, backup and recommendation engine, in one object.
  *
@@ -165,6 +168,43 @@ class Fermata(
         val result = MinimImport.convert(tables, zone)
         return result.copy(added = merge(result.events))
     }
+
+    /**
+     * Restores events from a backup, all or nothing. First replays the log as it would be after
+     * the restore, in memory, so events that cannot be applied are found before anything is
+     * written; then stores the new events in one [EventStore.appendAll] (a single transaction in
+     * [EventStore] implementations that persist); then rebuilds the library and taste model from
+     * the log. If anything throws, the log, the projections, the counter and the clock are as
+     * they were.
+     *
+     * Restored events keep their own ids. This phone keeps [deviceId]; if the backup holds events
+     * with this phone's id, the counter moves past the highest of them so no id is reused.
+     */
+    fun restore(events: List<Event>): RestoreStats = synchronized(lock) {
+        // Dry run: the same replay the rebuild below does, on the union, before writing anything.
+        val dryRun = LibraryProjector(config.countedPlayMs)
+        val dryModel = TasteModel(config)
+        for (e in EventLog.effective(store.all() + events)) {
+            dryRun.apply(e)
+            dryModel.apply(e)
+        }
+        dryRun.snapshot()
+        val added = store.appendAll(events)
+        store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
+        store.heads()[deviceId]?.let { if (it > counter) counter = it }
+        invalidate()
+        built()
+        RestoreStats(added, events.size)
+    }
+
+    /** Drops the library and taste projections and replays the whole log now. */
+    fun rebuild(): LibraryState = synchronized(lock) {
+        invalidate()
+        library()
+    }
+
+    /** How many events the log holds (0 on a fresh install). */
+    fun eventCount(): Long = store.count()
 
     fun library(): LibraryState = synchronized(lock) {
         librarySnapshot ?: built().first.snapshot().also { librarySnapshot = it }

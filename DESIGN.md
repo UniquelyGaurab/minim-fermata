@@ -38,8 +38,10 @@ minim-fermata/
   library/   pure Kotlin/JVM: the library projection (likes, playlists, history, not interested, stats)
   recs/      pure Kotlin/JVM: taste model, confidence, ranking, reasons (depends on log only)
   backup/    pure Kotlin/JVM: the .minim format (manifest + JSON Lines), encode/decode
-  core/      pure Kotlin/JVM: the Fermata facade tying the four together
-  android/   Android library (minSdk 28): SqliteEventStore, SAF backup worker
+  core/      pure Kotlin/JVM: the Fermata facade tying the four together; the Minim importer;
+             sync/ = backups, restore and multi-phone merge over any folder (FolderBackups)
+  android/   Android library (minSdk 28): SqliteEventStore, MinimDatabaseReader, and FermataBackups
+             (SAF folder, daily WorkManager job, settings-free state in SharedPreferences)
   sample/    tiny JVM demo
 ```
 
@@ -147,7 +149,7 @@ App-private storage is wiped when the app is uninstalled, so backups go to a fol
 
 ### What
 
-One file per day, `minim-backup-2026-11-11.minim`, which is a zip holding:
+One pair of files per phone, named by its device id: `minim-3f9a0c5e1b7d2468-latest.minim` and `minim-3f9a0c5e1b7d2468-previous.minim`. A phone only ever writes and deletes its own files, so phones sharing a synced folder never write the same file. (The first Android stub named files by day, `minim-backup-2026-11-11.minim`; those are still listed and can be restored, but are never written or deleted.) Each file is a zip holding:
 
 - `manifest.json`: format version, created time, device id, Fermata and app versions, event count, the version vector (highest counter per device), and a SHA-256 checksum per file
 - `fermata-events.jsonl.gz`: the full event log as gzipped JSON Lines, one event per line
@@ -170,25 +172,38 @@ JSON Lines rather than a raw database copy, because:
 
 **Never in the backup:** the Gemini API key or anything else secret. The format has no place for settings at all in version 1; if settings are added later, secrets stay out.
 
-### When
+### When and how
 
-- WorkManager, once a day, only while charging with battery not low
-- Written to a temp file, then renamed, so a half-written backup never replaces a good one
-- Keeps the last **7 daily** backups and deletes older ones
-- A "Back up now" button in Settings → Storage, with the last backup time shown
+- WorkManager unique periodic work (`fermata-daily-backup`), once a day, only while charging with battery not low. The job first merges the other phones' backups, then backs up, so each backup carries what it merged. Picking a folder schedules it.
+- A "Back up now" button in Settings → Storage (`backUpNow()` blocking, or `enqueueBackUpNow()` as unique one-time work), with the last backup time, or the error, shown from `status()`.
+- Each backup, step by step:
+  1. Delete this phone's own leftover temp files from a killed run (never another phone's).
+  2. Write the whole log to `minim-<device>-<time>-<nonce>.tmp` in the folder. Output is synced to disk before it is closed.
+  3. Read the temp file back in full and check it: format, both checksums, the event count in the manifest and in the file, the version vector and the device id must match what was written. If not, delete it and stop: the old `latest` is untouched.
+  4. Delete the old `previous`, rename the old `latest` to `previous`, rename the temp file to `latest`. If a rename fails, the old `latest` is renamed back (or was never moved), so the folder always has a good `latest` or, at worst for one run, a good `previous` holding the same data.
+- SAF has no atomic "rename over", so the order above is what keeps a good copy at every moment. A file is created as `application/octet-stream` so providers keep the exact name; a provider that answers with another name (`latest (1).minim`) is treated as a failure and its file removed or renamed back.
+- The result goes into `status()`: last attempt, last success, event count and size, and the last error (`NO_FOLDER`, `FOLDER_ACCESS_LOST`, `WRITE_FAILED`, `VERIFY_FAILED`, `RENAME_FAILED`) with a message. Lost folder permission and no folder are not retried (the user must act); other failures retry twice with WorkManager's backoff, then wait for the next day.
+- What is remembered about backups (status, which backup of each other phone was merged last, whether the user said no to the restore offer) lives in SharedPreferences `fermata_backup`, which describes this install: Minim's Auto Backup rules must exclude it, like the device id.
 
 ### Restore
 
-1. Fresh install, empty library: the first screen offers "Restore from a backup".
-2. The user picks the same folder. Minim lists the backups it finds, newest first.
-3. It checks the manifest and checksums and merges the events into the empty log. The new install gets a new device id, so its own events can never clash with the old install's.
-4. The library and the taste model are rebuilt from the log.
+1. Fresh install, empty library: `restoreOffer()` says whether to offer "Restore from a backup" (`PickFolder`, `NoBackups`, or `Available` with the list). It is not offered once the library has events, or after `dismissRestoreOffer()`.
+2. The user picks the same folder. `listBackups()` lists every phone's backups, newest first, read from the manifests only; a file that cannot be read, or is from a newer format, is listed with the reason and cannot be chosen.
+3. The chosen file is read and checked in full (manifest, checksums, every line) **before anything is touched**. Damaged, half-synced, gone or too new: nothing changes (`DAMAGED`, `NOT_FOUND`, `TOO_NEW`).
+4. `Fermata.restore` replays the log as it would be after the restore in memory first, then stores the new events in one SQLite transaction, then rebuilds the library and the taste model from the log. If any step fails, the log, projections, counter and clock are as they were (`RESTORE_FAILED`).
+5. Restored events keep their original ids. This phone keeps its own device id (stored outside backups); if the backup holds events with this phone's id, its counter continues past the highest of them, and its clock past the newest event.
 
-Because restore is a merge, restoring into a library that already has history is safe too: nothing is replaced, nothing is counted twice.
+Backups from older Fermata versions restore the same way: fields and event types a version does not know are kept as they are, and the projections are always rebuilt from the events, never read from the file. Because restore is a merge, restoring into a library that already has history is safe too: nothing is replaced, nothing is counted twice.
 
 ### Several phones
 
-Point every phone at the same folder (a Google Drive, Nextcloud or Dropbox folder through the SAF picker, or a Syncthing folder). Each phone writes its own daily backup and, when it runs, reads the other phones' newest backups and merges any events it has not seen (the manifest's version vector says at a glance whether there is anything new). Because merging is conflict-free, it does not matter which phone syncs first or how often.
+Point every phone at the same folder (a Google Drive, Nextcloud or Dropbox folder through the SAF picker, or a Syncthing folder). Each phone writes its own backup pair and, when it runs (`merge()`, and before every daily backup), reads the other phones' backups and merges any events it has not seen. Because merging is conflict-free, it does not matter which phone syncs first or how often.
+
+- **Only new events.** Merging is by event id, so repeating it adds nothing. The legacy and 5.9.0 rules travel inside the events (`replaces`, fixed legacy ids), so a play counts once whichever phones imported which copy, in whatever order.
+- **Unchanged backups are skipped.** The checksum of the event log in the manifest is remembered per phone; when it has not changed, only the manifest is read.
+- **Phones writing at the same time.** Each phone touches only its own files; temp files have another extension and are ignored by readers. A file that disappears while being read (its phone was rotating it) is looked up again once.
+- **Partial or corrupt files.** Every file is checked in full before any event from it is used. When a phone's `latest` fails (still syncing, damaged), its `previous` is used instead and the problem is reported in the result; the `latest` is tried again next time.
+- The result says how many phones, files merged, unchanged and events added, with any problem files.
 
 Later, maybe: a direct phone-to-phone transfer by QR code + local Wi-Fi, exchanging only the missing events.
 
@@ -265,10 +280,25 @@ val picks: List<Pick> = fermata.rank(candidates)
 val taste: TasteView = fermata.taste()           // for the "your taste" screen
 fermata.edit(TasteEditKind.OVER_IT, Subject.Artist("Artist"))
 
-// Backup, restore, sync
+// Backup, restore, sync (low level)
 fermata.export(out)                              // a .minim backup
 fermata.import(input)                            // merge a backup in
 fermata.merge(fermata2.eventsAfter(fermata.heads()))
+fermata.restore(events)                          // all or nothing, then rebuild
+
+// Backups for the app (android module). Blocking calls: run them off the main thread.
+val backups = FermataBackups(context, fermata, appVersion = BuildConfig.VERSION_NAME)
+backups.setFolder(treeUri)        // from ACTION_OPEN_DOCUMENT_TREE; keeps the permission, schedules daily
+backups.folder(); backups.hasFolderAccess(); backups.clearFolder()
+backups.backUpNow()               // BackupResult.Success / Failure(error, message)
+backups.enqueueBackUpNow()        // the same as background work
+backups.status()                  // BackupStatus: last success, last error, last merge
+backups.listBackups()             // List<BackupInfo>, any phone's, newest first
+backups.restore(info)             // RestoreResult
+backups.merge()                   // MergeResult
+backups.restoreOffer()            // NotNeeded / PickFolder / NoBackups / Available(backups)
+backups.dismissRestoreOffer()
+// The Application implements FermataHolder so the daily BackupWorker can reach Fermata.
 
 // One-off import of Minim's history (5.9.0 fermata_events + the old tables), safe to repeat
 fermata.importMinim(MinimDatabaseReader.read(libraryDb.readableDatabase))
@@ -280,7 +310,7 @@ fermata.importLegacy(EventBody.Play(track, 90_000), playedAt, legacyKey = "play|
 
 1. **Minim prep release:** start logging skips, session id, previous track and source in Minim, so richer history is already waiting when Fermata ships. *(Shipped in Minim 5.9.0 as the `fermata_events` table; Fermata's importer for it is in `core` (`MinimImport`) and `android` (`MinimDatabaseReader`).)*
 2. **Fermata core:** events, ids, merge, library projection, backup format, decayed taste scores and confidence, with JVM tests. *(First commit.)*
-3. **Fermata Android module:** SQLite event store, SAF daily backups and restore. *(SQLite store and a backup worker stub in the first commit.)*
+3. **Fermata Android module:** SQLite event store, SAF daily backups and restore. *(Done in 0.2.0: `FolderBackups` in `core`, `FermataBackups` in `android`, with temp-verify-rename backups, restore, multi-phone merge and the restore offer.)*
 4. **Integrate into Minim:** Minim's tables become projections; the old tables are imported as historical events.
 5. **Bridge release off Firebase:** pull Firestore down into the log, back up, sign out, delete the cloud copy.
 6. **Remove Firebase** entirely.
@@ -289,7 +319,8 @@ fermata.importLegacy(EventBody.Play(track, 90_000), playedAt, legacyKey = "play|
 ## Open questions
 
 - Should tapes feed the same taste model, or keep a separate one? *Dev's leaning (not final): a separate one, so long podcasts don't steer song recommendations.*
-- Should backups have an optional password (they hold listening history in a folder other apps, or a cloud provider, might read)? *Dev's leaning (not final): yes, eventually, as an option.*
-- Should Minim's "Clear listening history" also empty `fermata_events` (and, later, the matching events in the log)? If it does, a plain `DELETE` keeps the row ids from being reused.
+- Should backups have an optional password (they hold listening history in a folder other apps, or a cloud provider, might read)? *Dev's leaning (not final): yes, eventually, as an option. Not built in 0.2.0; the format has room for it as a new format version.*
+- ~~Should Minim's "Clear listening history" also empty `fermata_events`?~~ **Decided: yes.** Minim 5.9.1 empties `fermata_events` along with `plays` and `tape_plays`, so the import never brings cleared plays back. A plain `DELETE` keeps the row ids from being reused.
+- **Still open: "Clear listening history" once Minim writes through Fermata.** The log is append-only and merged between phones, so deleting events on one phone is undone the next time it merges another phone's backup or restores one. It needs a decision before the integration release: most likely a `history_clear` event ("hide plays before time T") that the library and taste model honour on every phone, plus whether old backups in the folder should be rewritten.
 - How long should a phone keep reading another phone's backups after it stops writing new ones (a lost or retired phone)?
 - Do settings (theme, audio quality, and so on) belong in the log or in a separate, secret-free settings file?

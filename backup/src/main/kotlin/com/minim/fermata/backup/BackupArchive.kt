@@ -92,7 +92,11 @@ object BackupArchive {
     const val EXTENSION = ".minim"
     const val MIME_TYPE = "application/octet-stream"
 
-    /** `minim-backup-2026-11-11.minim` */
+    /**
+     * `minim-backup-2026-11-11.minim`: the one-file-per-day name the first Android stub wrote.
+     * New backups use [BackupNames] (one latest/previous pair per phone); files with this older
+     * name are still listed and can be restored.
+     */
     fun fileName(date: LocalDate): String = "minim-backup-$date$EXTENSION"
 
     fun isBackupName(name: String): Boolean = name.startsWith("minim-backup-") && name.endsWith(EXTENSION)
@@ -129,35 +133,76 @@ object BackupArchive {
         return manifest
     }
 
+    /**
+     * Reads only `manifest.json`, without checking the rest of the file. Cheap (the manifest is
+     * the first entry), for listing backups and for telling whether a backup changed. A manifest
+     * from a newer format is returned as it is; [read] is what refuses it.
+     */
+    fun readManifest(input: InputStream): Manifest {
+        try {
+            val zip = ZipInputStream(input)
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                if (entry.name == MANIFEST) return parseManifest(zip.readAllBytesCompat())
+                zip.closeEntry()
+            }
+        } catch (e: BackupException) {
+            throw e
+        } catch (e: java.io.FileNotFoundException) {
+            throw e
+        } catch (e: Exception) {
+            throw BackupException("not a readable Minim backup: ${e.message}", e)
+        }
+        throw BackupException("not a Minim backup: no $MANIFEST")
+    }
+
     /** Reads and verifies a backup. Throws [BackupException] when it is damaged or too new. */
     fun read(input: InputStream): Backup {
         val entries = HashMap<String, ByteArray>()
-        ZipInputStream(input).let { zip ->
-            while (true) {
-                val entry = zip.nextEntry ?: break
-                if (!entry.isDirectory) entries[entry.name] = zip.readAllBytesCompat()
-                zip.closeEntry()
+        try {
+            ZipInputStream(input).let { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    if (!entry.isDirectory) entries[entry.name] = zip.readAllBytesCompat()
+                    zip.closeEntry()
+                }
             }
+        } catch (e: java.io.FileNotFoundException) {
+            throw e
+        } catch (e: java.io.IOException) {
+            // A truncated or half-synced file usually fails here (EOF inside an entry).
+            throw BackupException("damaged backup file: ${e.message}", e)
         }
         val manifestBytes = entries[MANIFEST] ?: throw BackupException("not a Minim backup: no $MANIFEST")
-        val manifest = try {
-            Manifest.fromJson(Json.parseToJsonElement(manifestBytes.toString(Charsets.UTF_8)).jsonObject)
-        } catch (e: Exception) {
-            throw BackupException("unreadable $MANIFEST: ${e.message}", e)
-        }
+        val manifest = parseManifest(manifestBytes)
         if (manifest.format > FORMAT) {
-            throw BackupException("backup format ${manifest.format} is newer than this version reads ($FORMAT)")
+            throw BackupTooNewException("backup format ${manifest.format} is newer than this version reads ($FORMAT)")
         }
         for (f in manifest.files) {
             val bytes = entries[f.name] ?: throw BackupException("missing ${f.name}")
             if (sha256(bytes) != f.sha256) throw BackupException("checksum mismatch in ${f.name}")
         }
         val eventBytes = entries[EVENTS] ?: throw BackupException("missing $EVENTS")
-        val events = Jsonl.decodeGzip(eventBytes)
+        val events = try {
+            Jsonl.decodeGzip(eventBytes)
+        } catch (e: BackupException) {
+            throw e
+        } catch (e: Exception) {
+            throw BackupException("damaged $EVENTS: ${e.message}", e)
+        }
         if (events.size.toLong() != manifest.eventCount) {
             throw BackupException("expected ${manifest.eventCount} events, found ${events.size}")
         }
         return Backup(manifest, events)
+    }
+
+    /** The SHA-256 of the event log inside a backup, as its manifest records it, or null. */
+    fun eventsChecksum(manifest: Manifest): String? = manifest.files.firstOrNull { it.name == EVENTS }?.sha256
+
+    private fun parseManifest(bytes: ByteArray): Manifest = try {
+        Manifest.fromJson(Json.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject)
+    } catch (e: Exception) {
+        throw BackupException("unreadable $MANIFEST: ${e.message}", e)
     }
 
     private val prettyJson = Json { prettyPrint = true }

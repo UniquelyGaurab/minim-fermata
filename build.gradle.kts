@@ -12,7 +12,7 @@ plugins {
 // includeBuild substitutes these coordinates with the local projects automatically.
 allprojects {
     group = "com.github.UniquelyGaurab.minim-fermata"
-    version = "0.1.0-SNAPSHOT"
+    version = "0.2.0-SNAPSHOT"
 }
 
 val jvmModules = listOf("log", "library", "recs", "backup", "core", "sample")

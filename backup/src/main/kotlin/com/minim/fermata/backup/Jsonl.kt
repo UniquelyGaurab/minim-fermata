@@ -46,4 +46,7 @@ object Jsonl {
     fun decodeGzip(bytes: ByteArray): List<Event> = GZIPInputStream(bytes.inputStream()).use { read(it) }
 }
 
-class BackupException(message: String, cause: Throwable? = null) : Exception(message, cause)
+open class BackupException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/** The backup was made by a newer version, in a format this one cannot read. */
+class BackupTooNewException(message: String) : BackupException(message)

@@ -4,7 +4,7 @@ On-device storage, backup and recommendations for [Minim](https://github.com/Uni
 
 A fermata is the music symbol that says "hold this note longer".
 
-**Status: early.** This is the first commit: the core (events, merge, library projection, backup format, a simple decayed taste score and the confidence blend) is in place and tested. The Android SQLite store works; the backup worker is a stub. Minim does not use Fermata yet. See [DESIGN.md](DESIGN.md) for the full plan and build order.
+**Status: early.** The core (events, merge, library projection, backup format, a simple decayed taste score and the confidence blend) is in place and tested, and so is the Android side: the SQLite store, daily backups to a folder you pick (written to a temp file, checked, then renamed into place), restore, and merging other phones' backups. Minim does not use Fermata yet. See [DESIGN.md](DESIGN.md) for the full plan and build order.
 
 ## Principles
 
@@ -32,8 +32,8 @@ A fermata is the music symbol that says "hold this note longer".
 | `library` | `LibraryProjection`: likes, playlists with order, play history, stats, not interested | No |
 | `recs` | `TasteModel` (decayed track and artist scores, confidence), `Ranker` (confidence blend, reasons) | No |
 | `backup` | The `.minim` format: `BackupArchive`, `Manifest`, JSON Lines `EventCodec` | No |
-| `core` | The `Fermata` facade: `record`, `library`, `rank`, `taste`, `export`, `import`, `merge` | No |
-| `android` | `SqliteEventStore`, `MinimDatabaseReader` (reads Minim's tables for `importMinim`), SAF backup helpers and `BackupWorker` (stub), minSdk 28 | Yes |
+| `core` | The `Fermata` facade: `record`, `library`, `rank`, `taste`, `export`, `import`, `merge`, `restore`; `FolderBackups` (backup, restore and merge over any folder) | No |
+| `android` | `SqliteEventStore`, `MinimDatabaseReader` (reads Minim's tables for `importMinim`), `FermataBackups` (SAF folder, back up now, daily `BackupWorker`, status, list, restore, merge, restore offer), minSdk 28 | Yes |
 | `sample` | A tiny JVM walk-through | No |
 
 The pure modules have zero Android imports and target JVM 17 bytecode. An app that only wants recommendations can depend on `recs` alone and feed it its own events.
