@@ -1,0 +1,28 @@
+# Versions match Minim's toolchain (Gradle 8.5, AGP 8.2.2, Kotlin 1.9.22, JDK 17), so the two
+# builds can be combined with includeBuild without plugin version clashes.
+[versions]
+agp = "8.2.2"
+kotlin = "1.9.22"
+kotlinxSerialization = "1.6.2"
+junit5 = "5.10.1"
+junitPlatform = "1.10.1"
+junit4 = "4.13.2"
+robolectric = "4.11.1"
+work = "2.9.0"
+androidxTestCore = "1.5.0"
+
+[libraries]
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+kotlin-test-junit5 = { module = "org.jetbrains.kotlin:kotlin-test-junit5", version.ref = "kotlin" }
+kotlin-test-junit4 = { module = "org.jetbrains.kotlin:kotlin-test-junit", version.ref = "kotlin" }
+junit-jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine", version.ref = "junit5" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version.ref = "junitPlatform" }
+junit4 = { module = "junit:junit", version.ref = "junit4" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+androidx-test-core = { module = "androidx.test:core", version.ref = "androidxTestCore" }
+androidx-work-runtime = { module = "androidx.work:work-runtime", version.ref = "work" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+android-library = { id = "com.android.library", version.ref = "agp" }
