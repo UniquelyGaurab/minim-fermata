@@ -80,6 +80,10 @@ class SqliteEventStoreTest {
         // Deleting a device's newest events never lowers its head, so its counters are not reused.
         assertEquals(1, store.removeAll(listOf(EventId("a", 4))))
         assertEquals(4L, store.heads()["a"])
+        // loggedHeads is what a backup's manifest records: only the events still in the log.
+        store.appendAll(listOf(Event(EventId.legacy("likes:Z"), EventContext.at(50), EventBody.Like(Subject.Track(TrackRef("Z"))))))
+        assertEquals(mapOf("a" to 3L, "b" to 3L), store.loggedHeads())
+        assertEquals(com.minim.fermata.log.EventLog.heads(store.all()), store.loggedHeads())
         assertEquals(4L, Fermata(store, "a").record(EventBody.Like(Subject.Artist("Q"))).id.counter - 1)
     }
 

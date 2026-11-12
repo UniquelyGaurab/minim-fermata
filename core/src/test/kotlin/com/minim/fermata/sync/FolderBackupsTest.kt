@@ -146,12 +146,13 @@ class FolderBackupsTest {
         assertEquals(3L, read("minim-phoneA-previous.minim").manifest.eventCount)
         assertEquals("5.10.0", read("minim-phoneA-latest.minim").manifest.appVersion)
 
-        // A third backup drops the oldest: still one pair per phone.
+        // A third backup the same day replaces latest only: previous moves on at most once a day.
         clock.now += HOUR
         f.someHistory(a)
         assertIs<BackupResult.Success>(backups.backUp(folder()))
-        assertEquals(2, names().size)
-        assertEquals(4L, read("minim-phoneA-previous.minim").manifest.eventCount)
+        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
+        assertEquals(5L, read("minim-phoneA-latest.minim").manifest.eventCount)
+        assertEquals(3L, read("minim-phoneA-previous.minim").manifest.eventCount)
 
         val status = backups.status()
         assertTrue(status.ok)
@@ -192,6 +193,7 @@ class FolderBackupsTest {
         f.someHistory(b)
         backups.backUp(faulty) // now latest (2 events) + previous (1 event)
 
+        clock.now += FolderBackups.PREVIOUS_EVERY_MS // previous is due: latest is rotated this time
         f.someHistory(c)
         faulty.failRenameTo = "minim-phoneA-latest.minim"
         val failed = assertIs<BackupResult.Failure>(backups.backUp(faulty))

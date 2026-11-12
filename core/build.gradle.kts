@@ -10,4 +10,5 @@ dependencies {
     api(project(":recs"))
     api(project(":backup"))
     testImplementation(testFixtures(project(":log")))
+    testImplementation(libs.kotlinx.serialization.json) // to rewrite manifests in tests
 }

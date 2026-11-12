@@ -44,6 +44,11 @@ sealed interface BackupResult {
         val fileName: String,
         val eventCount: Long,
         val bytes: Long,
+        /**
+         * False when [FolderBackups.backUpIfChanged] found that this phone's `latest` already
+         * holds everything in the log, so nothing was written.
+         */
+        val written: Boolean = true,
     ) : BackupResult
 
     data class Failure(override val at: Long, val error: BackupError, val message: String) : BackupResult
@@ -84,6 +89,13 @@ data class BackupState(
     val status: BackupStatus = BackupStatus(),
     val merged: Map<String, String> = emptyMap(),
     val restoreOfferDismissed: Boolean = false,
+    /** When this phone last turned its `latest` into `previous` (this phone's clock), or null. */
+    val previousRotatedAt: Long? = null,
+    /**
+     * Another phone's device id to the `legacyDigest` of the backup last merged from it, so a
+     * merge can skip a changed backup whose manifest shows nothing new (see [FolderBackups.mergeFromFolder]).
+     */
+    val mergedLegacy: Map<String, String> = emptyMap(),
 )
 
 /** Where [BackupState] is kept: SharedPreferences on Android, memory in tests. */
@@ -145,7 +157,10 @@ data class MergeResult(
     val phones: Int,
     /** Backup files read and merged. */
     val filesMerged: Int,
-    /** Phones whose backup had not changed since the last merge, so it was not read again. */
+    /**
+     * Phones whose backup had nothing new for this phone, told from its manifest alone (the same
+     * file as last time, or a version vector this phone already has), so it was not read in full.
+     */
     val unchanged: Int,
     /** Events new to this phone. */
     val eventsAdded: Int,

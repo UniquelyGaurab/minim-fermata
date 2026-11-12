@@ -3,10 +3,13 @@ package com.minim.fermata.android
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
@@ -41,11 +44,30 @@ import java.util.concurrent.TimeUnit
  * backups.restore(chosen)                            // all or nothing
  * backups.merge()                                    // pull in the other phones' new events
  * backups.restoreOffer()                             // fresh install: offer a restore?
+ *
+ * // Automatic backups (main thread is fine: these only queue WorkManager jobs):
+ * backups.enqueueMergeOnOpen()                       // app came to the foreground
+ * backups.enqueueBackupOnBackground()                // app went to the background
  * ```
  *
- * Every call except [setFolder], [folder], [clearFolder], [status], [scheduleDaily] and
- * [enqueueBackUpNow] reads or writes files: call them off the main thread. Calls run one at a time
- * (the daily job included), so they are safe to make from anywhere.
+ * Every call except [setFolder], [folder], [clearFolder], [status], [scheduleDaily] and the
+ * `enqueue…` calls reads or writes files: call them off the main thread. Calls run one at a time
+ * (every job included: Fermata holds one lock for all backups, merges and restores in the
+ * process), so they are safe to make from anywhere.
+ *
+ * The WorkManager jobs, each under its own unique name:
+ * - [DAILY_WORK]: periodic, once a day while charging; merge, then [backUpIfChanged].
+ * - [NOW_WORK]: "Back up now" in the background; merge, then a full backup. KEEP: a second tap
+ *   while one is queued or running does nothing. Expedited.
+ * - [ON_CLOSE_WORK]: the backup when the app goes to the background; [backUpIfChanged] only.
+ *   REPLACE: a newer close takes the place of one still waiting. Expedited.
+ * - [MERGE_WORK]: the merge when the app opens; manifests first, see [merge]. KEEP. Expedited.
+ * - [ONCE_WORK]: startup and after a history clear (see [enqueueBackupOnce]).
+ *
+ * Expedited jobs run right away on Android 12 and later, and fall back to ordinary one-time work
+ * when the app is out of expedited quota. On Android 9 to 11 they are queued as ordinary one-time
+ * work, which those versions run right away with no constraints (an expedited job there would need
+ * a foreground notification). WorkManager keeps every job across the app being killed.
  */
 class FermataBackups(
     context: Context,
@@ -98,12 +120,43 @@ class FermataBackups(
     fun backUpNow(replacePrevious: Boolean = false): BackupResult = core.backUp(backupFolder(), replacePrevious)
 
     /**
+     * Backs up only if the log has something this phone's `latest` backup lacks (compares the
+     * version vector and event count with that file's manifest), blocking. When nothing changed it
+     * writes nothing and returns a [BackupResult.Success] with `written = false`.
+     */
+    fun backUpIfChanged(): BackupResult = core.backUpIfChanged(backupFolder())
+
+    /**
+     * The backup for when the app goes to the background: an expedited one-time job that runs
+     * [FermataHolder.beforeBackup], then [backUpIfChanged], and survives the app being killed
+     * right after. A newer call replaces one still waiting. Does nothing without a folder.
+     */
+    fun enqueueBackupOnBackground(): UUID? {
+        if (folder() == null) return null
+        val request = expedited(BackupWorker.MODE_ON_CLOSE)
+        WorkManager.getInstance(context).enqueueUniqueWork(ON_CLOSE_WORK, ExistingWorkPolicy.REPLACE, request)
+        return request.id
+    }
+
+    /**
+     * The merge for when the app opens: an expedited one-time job that runs [merge] (cheap when
+     * nothing is new: only manifests are read) and calls [FermataHolder.onFermataChanged] when it
+     * added events. A call while one is queued or running does nothing. Does nothing without a folder.
+     */
+    fun enqueueMergeOnOpen(): UUID? {
+        if (folder() == null) return null
+        val request = expedited(BackupWorker.MODE_MERGE)
+        WorkManager.getInstance(context).enqueueUniqueWork(MERGE_WORK, ExistingWorkPolicy.KEEP, request)
+        return request.id
+    }
+
+    /**
      * "Back up now" as background work: merges the other phones' backups, then backs up, even if
      * the app is closed. A second tap while one is queued does nothing. Watch the id with
      * WorkManager, or read [status] afterwards.
      */
     fun enqueueBackUpNow(): UUID {
-        val request = OneTimeWorkRequestBuilder<BackupWorker>().build()
+        val request = expedited(BackupWorker.MODE_NOW)
         WorkManager.getInstance(context).enqueueUniqueWork(NOW_WORK, ExistingWorkPolicy.KEEP, request)
         return request.id
     }
@@ -157,7 +210,11 @@ class FermataBackups(
         return core.restore(folder, backup)
     }
 
-    /** Adds the events this phone has not seen from the other phones' latest backups. */
+    /**
+     * Adds the events this phone has not seen from the other phones' latest backups. Reads each
+     * backup's manifest first and reads the whole file only when its version vector (or its
+     * legacy events) has something new, so it is cheap when nothing is.
+     */
     fun merge(): MergeResult = core.mergeFromFolder(backupFolder())
 
     /** On a fresh install (empty library): whether to offer "Restore from a backup", and what. */
@@ -166,9 +223,9 @@ class FermataBackups(
     /** The user said no to the restore offer: don't offer it again on this install. */
     fun dismissRestoreOffer() = core.dismissRestoreOffer()
 
-    /** The daily job's work: merge, then back up. */
-    internal fun runScheduled(replacePrevious: Boolean = false): Pair<MergeResult, BackupResult> =
-        core.mergeAndBackUp(backupFolder(), replacePrevious)
+    /** The daily job's work: merge, then back up (only if changed, unless [onlyIfChanged] is false). */
+    internal fun runScheduled(replacePrevious: Boolean = false, onlyIfChanged: Boolean = true): Pair<MergeResult, BackupResult> =
+        core.mergeAndBackUp(backupFolder(), replacePrevious, onlyIfChanged)
 
     /** The folder to use: null when none is set, one that reports lost access when the permission is gone. */
     private fun backupFolder(): BackupFolder? {
@@ -194,7 +251,16 @@ class FermataBackups(
         const val DAILY_WORK = "fermata-daily-backup"
         const val NOW_WORK = "fermata-backup-now"
         const val ONCE_WORK = "fermata-backup-once"
+        const val ON_CLOSE_WORK = "fermata-backup-on-close"
+        const val MERGE_WORK = "fermata-merge-on-open"
         private const val RW = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+
+        /** A one-time job in [mode]: expedited on Android 12+, with ordinary work as the fallback. */
+        internal fun expedited(mode: String, sdk: Int = Build.VERSION.SDK_INT): OneTimeWorkRequest {
+            val b = OneTimeWorkRequestBuilder<BackupWorker>().setInputData(workDataOf(BackupWorker.MODE to mode))
+            if (sdk >= Build.VERSION_CODES.S) b.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            return b.build()
+        }
 
         internal fun dailyRequest() = PeriodicWorkRequestBuilder<BackupWorker>(1, TimeUnit.DAYS)
             .setConstraints(
@@ -226,17 +292,36 @@ interface FermataHolder {
 }
 
 /**
- * The daily backup and "Back up now": merges the other phones' backups, then backs up. A missing
- * folder or lost permission is not retried (the status shows it and Settings asks the user); other
- * failures are retried twice with WorkManager's backoff, then wait for the next day.
+ * Every backup job (see [FermataBackups] for which runs when). By [MODE]: the daily job and the
+ * startup one merge, then back up only if something changed; "Back up now" and the one after a
+ * clear merge, then always back up; the on-close one only backs up if something changed; the
+ * on-open one only merges. A missing folder or lost permission is not retried (the status shows it
+ * and Settings asks the user); other failures are retried twice with WorkManager's backoff.
  */
 class BackupWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
     override fun doWork(): Result {
         val holder = applicationContext as? FermataHolder ?: return Result.failure()
-        runCatching { holder.beforeBackup() }
+        val fermata = try {
+            holder.fermata
+        } catch (e: Exception) {
+            return Result.failure() // the app could not start Fermata: nothing to back up
+        }
+        val backups = FermataBackups(applicationContext, fermata, holder.appVersion)
         val replace = inputData.getBoolean(REPLACE_PREVIOUS, false)
-        val (merge, backup) = FermataBackups(applicationContext, holder.fermata, holder.appVersion).runScheduled(replace)
-        if (merge.eventsAdded > 0) runCatching { holder.onFermataChanged() }
+        val mode = inputData.getString(MODE) ?: MODE_SCHEDULED
+        if (mode == MODE_MERGE) {
+            val merge = backups.merge()
+            if (merge.eventsAdded > 0) runCatching { holder.onFermataChanged() }
+            return Result.success() // the status shows a failed merge; the next open tries again
+        }
+        runCatching { holder.beforeBackup() }
+        val backup = if (mode == MODE_ON_CLOSE) {
+            backups.backUpIfChanged()
+        } else {
+            val (merge, result) = backups.runScheduled(replace, onlyIfChanged = mode == MODE_SCHEDULED && !replace)
+            if (merge.eventsAdded > 0) runCatching { holder.onFermataChanged() }
+            result
+        }
         return when {
             backup is BackupResult.Success -> Result.success()
             backup is BackupResult.Failure && backup.error in NOT_RETRIED -> Result.success()
@@ -248,6 +333,13 @@ class BackupWorker(context: Context, params: WorkerParameters) : Worker(context,
     companion object {
         /** Input: also replace this phone's `previous` file (see [FermataBackups.enqueueBackupOnce]). */
         const val REPLACE_PREVIOUS = "replace_previous"
+
+        /** Input: which job this is. Missing means [MODE_SCHEDULED] (jobs queued by older versions). */
+        const val MODE = "mode"
+        const val MODE_SCHEDULED = "scheduled"
+        const val MODE_NOW = "now"
+        const val MODE_ON_CLOSE = "on_close"
+        const val MODE_MERGE = "merge"
         private const val MAX_RETRIES = 2
         private val NOT_RETRIED = setOf(BackupError.NO_FOLDER, BackupError.FOLDER_ACCESS_LOST)
     }

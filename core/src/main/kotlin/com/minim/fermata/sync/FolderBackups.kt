@@ -21,10 +21,15 @@ import java.time.Clock
  *
  * **Backup** ([backUp]): the whole log goes to `minim-<device>-<nonce>.tmp`, which is then read
  * back and checked (format, checksums, event count, version vector, device id). Only a good file
- * is moved into place: the old `latest` becomes `previous` (the old `previous` is deleted) and the
- * temp file becomes `latest`. If any step fails the folder still has a good `latest` (the old one,
- * put back if it had been moved), and the temp file is removed. Temp files a killed run left behind
- * are cleaned up on the next run; only this phone's own files are ever written or deleted.
+ * is moved into place as `latest`. `latest` is replaced on every backup, but `previous` moves on
+ * at most once a day ([PREVIOUS_EVERY_MS]): then the old `latest` becomes `previous` (the old
+ * `previous` is deleted); otherwise the old `latest` is parked under a temp name while the new
+ * file moves in, and deleted after. So backing up every time the app closes never turns
+ * `previous` into a copy from five minutes ago. If any step fails the folder still has a good
+ * `latest` (the old one, put back if it had been moved), and the temp file is removed. Temp files
+ * a killed run left behind are cleaned up on the next run (a parked `latest` is put back first if
+ * the run died before the new one moved in); only this phone's own files are ever written or
+ * deleted. [backUpIfChanged] skips the whole write when `latest` already holds the log.
  *
  * **Restore** ([restore]): the chosen file is read and fully checked before anything is touched,
  * then loaded with [Fermata.restore] (all or nothing, projections rebuilt from the log).
@@ -33,7 +38,11 @@ import java.time.Clock
  * `latest` is damaged or half-synced) is checked and merged. Merging is by event id, so repeating
  * it adds nothing; the legacy and 5.9.0 rules travel inside the events (`replaces`), so a play
  * counts once whichever phones imported which copy. A backup whose event log has the same
- * checksum as the one merged last time is not read again.
+ * checksum as the one merged last time is not read again, and neither is one whose manifest shows
+ * nothing new: its version vector is covered by this phone's, and its legacy events (which have
+ * no counters) are the set merged from that phone last time. Only a backup with something new,
+ * an older manifest without the legacy fields, or a manifest that can't be read is read in full,
+ * so a merge when the app opens stays cheap.
  *
  * All operations of all instances run one at a time, so the daily job and "Back up now" never
  * overlap in one app. Calls block: run them off the main thread.
@@ -69,6 +78,57 @@ class FolderBackups(
         }
         recordResult(result)
         result
+    }
+
+    /**
+     * Backs up only when the log holds something this phone's `latest` in [folder] does not.
+     * Reads just that file's manifest and compares its version vector and event count with the
+     * log's: when they match, nothing is written and the result is a [BackupResult.Success] with
+     * `written = false` (recorded in [status] as a backup that worked, since `latest` is
+     * current). A missing, unreadable, older-format or other-phone `latest` means a full backup.
+     * For backups the app starts itself (when it goes to the background, the daily job).
+     */
+    fun backUpIfChanged(folder: BackupFolder?): BackupResult = synchronized(LOCK) {
+        if (folder != null) {
+            val now = clock.millis()
+            val current = try {
+                upToDate(folder, now)
+            } catch (e: SecurityException) {
+                val lost = BackupResult.Failure(now, BackupError.FOLDER_ACCESS_LOST, "Lost access to the backup folder: pick it again")
+                recordResult(lost)
+                return lost
+            }
+            if (current != null) {
+                recordResult(current)
+                return current
+            }
+        }
+        backUp(folder)
+    }
+
+    /** A not-written result when this phone's `latest` in [folder] already holds the whole log, else null. */
+    private fun upToDate(folder: BackupFolder, now: Long): BackupResult.Success? {
+        val latestName = BackupNames.latest(deviceId)
+        val latest = try {
+            folder.list().firstOrNull { it.name == latestName }
+        } catch (e: SecurityException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        val m = try {
+            folder.openInput(latest).use { BackupArchive.readManifest(it) }
+        } catch (e: SecurityException) {
+            throw e
+        } catch (e: Exception) {
+            return null
+        }
+        if (m.format != BackupArchive.FORMAT || m.deviceId != deviceId) return null
+        // Both read under Fermata's lock, so no event can land between them.
+        val (heads, count) = fermata.transaction { fermata.loggedHeads() to fermata.eventCount() }
+        if (m.heads != heads || m.eventCount != count) return null
+        val bytes = if (latest.size >= 0) latest.size else state.load().status.lastBytes
+        return BackupResult.Success(now, latest.name, count, bytes, written = false)
     }
 
     /** The last backup result, as Settings → Storage shows it. */
@@ -128,8 +188,8 @@ class FolderBackups(
         }
         try {
             val stats = fermata.restore(read.events)
-            BackupArchive.eventsChecksum(read.manifest)?.let { sha ->
-                if (read.manifest.deviceId != deviceId) remember(read.manifest.deviceId, sha)
+            if (read.manifest.deviceId != deviceId) {
+                remember(read.manifest.deviceId, BackupArchive.eventsChecksum(read.manifest), BackupArchive.legacyDigest(read.events))
             }
             RestoreResult.Success(
                 stats.added, stats.total, read.manifest.deviceId, read.manifest.createdAt, read.manifest.fermataVersion,
@@ -200,9 +260,17 @@ class FolderBackups(
         return MergeResult(now, byPhone.size, merged, unchanged, added, problems)
     }
 
-    /** The daily job: merge the other phones' backups in, then back up (so this backup carries them on). */
-    fun mergeAndBackUp(folder: BackupFolder?, replacePrevious: Boolean = false): Pair<MergeResult, BackupResult> = synchronized(LOCK) {
-        mergeFromFolder(folder) to backUp(folder, replacePrevious)
+    /**
+     * The daily job: merge the other phones' backups in, then back up (so this backup carries them
+     * on). With [onlyIfChanged] the backup is [backUpIfChanged]; [replacePrevious] always writes.
+     */
+    fun mergeAndBackUp(
+        folder: BackupFolder?,
+        replacePrevious: Boolean = false,
+        onlyIfChanged: Boolean = false,
+    ): Pair<MergeResult, BackupResult> = synchronized(LOCK) {
+        val merge = mergeFromFolder(folder)
+        merge to if (onlyIfChanged && !replacePrevious) backUpIfChanged(folder) else backUp(folder, replacePrevious)
     }
 
     /**
@@ -229,12 +297,20 @@ class FolderBackups(
     private fun writeBackup(folder: BackupFolder, now: Long, replacePrevious: Boolean = false): BackupResult {
         val latestName = BackupNames.latest(deviceId)
         val previousName = BackupNames.previous(deviceId)
-        val entries = folder.list()
+        var entries = folder.list()
 
         // Temp files of a killed run. Only this phone's: another phone may be writing its own now.
-        for (stale in entries.filter { BackupNames.isOwnTemp(it.name, deviceId) }) {
-            runCatching { folder.delete(stale) }
+        // A run killed after parking the old latest but before the new one moved in left no latest:
+        // the parked file goes back first.
+        val stale = entries.filter { BackupNames.isOwnTemp(it.name, deviceId) }
+        val parkedOld = if (entries.none { it.name == latestName }) {
+            stale.filter { it.name.endsWith(PARKED_SUFFIX) }.maxByOrNull { it.name }
+        } else {
+            null
         }
+        val putBack = parkedOld?.takeIf { runCatching { folder.rename(it, latestName) }.isSuccess }
+        for (old in stale) if (old != putBack) runCatching { folder.delete(old) }
+        if (putBack != null) entries = folder.list()
 
         // 1. Write the temp file.
         val temp = folder.create(BackupNames.temp(deviceId, "$now-${nonce()}"))
@@ -257,18 +333,28 @@ class FolderBackups(
             return BackupResult.Failure(now, BackupError.VERIFY_FAILED, "The new backup didn't check out ($problem); the old one is kept")
         }
 
-        // 3. latest -> previous (the old previous goes), then temp -> latest.
+        // 3. When previous is due (at most once a day): latest -> previous (the old previous goes).
+        //    Otherwise the old latest is parked under a temp name and deleted once the new one is in.
+        //    Then temp -> latest.
         val oldLatest = entries.firstOrNull { it.name == latestName }
         val oldPrevious = entries.firstOrNull { it.name == previousName }
+        val rotate = oldLatest != null && (replacePrevious || oldPrevious == null || previousDue(now))
         var movedLatest: FolderEntry? = null
+        var parked: FolderEntry? = null
         var newFile = temp
         try {
             if (oldLatest != null) {
-                if (oldPrevious != null) folder.delete(oldPrevious)
-                movedLatest = folder.rename(oldLatest, previousName)
+                if (rotate) {
+                    if (oldPrevious != null) folder.delete(oldPrevious)
+                    movedLatest = folder.rename(oldLatest, previousName)
+                } else {
+                    parked = folder.rename(oldLatest, BackupNames.temp(deviceId, "$now-${nonce()}$PARKED"))
+                }
             }
             newFile = folder.rename(temp, latestName)
             check(newFile.name == latestName) { "the folder named the backup ${newFile.name}" }
+            if (rotate) state.save(state.load().copy(previousRotatedAt = now))
+            parked?.let { runCatching { folder.delete(it) } } // if this fails, the next run deletes it
             if (replacePrevious) replacePreviousWith(folder, newFile, manifest, now, movedLatest ?: oldPrevious)
             return BackupResult.Success(now, newFile.name, manifest.eventCount, bytes)
         } catch (e: SecurityException) {
@@ -278,9 +364,21 @@ class FolderBackups(
             if (newFile.name != latestName) {
                 runCatching { folder.delete(newFile) }
                 movedLatest?.let { runCatching { folder.rename(it, latestName) } }
+                parked?.let { runCatching { folder.rename(it, latestName) } }
             }
             return BackupResult.Failure(now, BackupError.RENAME_FAILED, "Couldn't move the new backup into place (${describe(e)}); the old one is kept")
         }
+    }
+
+    /**
+     * Whether `previous` may move on now: never moved on (or not recorded), a day or more since
+     * it last did, or the clock is now well before the last time (it was set back, or was ahead
+     * then). In that last case it moves on once and the day counts from the new time, so a wrong
+     * clock costs at most one extra move, never a `previous` that moves on every backup or never.
+     */
+    private fun previousDue(now: Long): Boolean {
+        val last = state.load().previousRotatedAt ?: return true
+        return now - last >= PREVIOUS_EVERY_MS || now < last - CLOCK_SLACK_MS
     }
 
     /**
@@ -352,23 +450,64 @@ class FolderBackups(
             readChecked(folder, current, phone)
         } ?: return null
         val added = fermata.merge(backup.events)
-        BackupArchive.eventsChecksum(backup.manifest)?.let { remember(phone, it) }
+        remember(phone, BackupArchive.eventsChecksum(backup.manifest), BackupArchive.legacyDigest(backup.events))
         return added
     }
 
-    /** The checked backup in [entry], or null when its event log is the one merged last time. */
+    /**
+     * The checked backup in [entry], or null when its manifest alone shows nothing new: the same
+     * event log as merged last time, or (see [nothingNew]) nothing this phone lacks. A manifest
+     * that can't be read falls through to the full read, which checks the file and reports it.
+     */
     private fun readChecked(folder: BackupFolder, entry: FolderEntry, phone: String): Backup? {
-        val seen = state.load().merged[phone]
-        if (seen != null) {
-            val m = folder.openInput(entry).use { BackupArchive.readManifest(it) }
-            if (BackupArchive.eventsChecksum(m) == seen) return null
+        val m = try {
+            folder.openInput(entry).use { BackupArchive.readManifest(it) }
+        } catch (e: FileNotFoundException) {
+            throw e
+        } catch (e: SecurityException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+        if (m != null) {
+            val s = state.load()
+            val sha = BackupArchive.eventsChecksum(m)
+            if (sha != null && sha == s.merged[phone]) return null
+            if (nothingNew(m, phone, s)) {
+                remember(phone, sha, m.legacyDigest)
+                return null
+            }
         }
         return folder.openInput(entry).use { BackupArchive.read(it) }
     }
 
-    private fun remember(phone: String, sha: String) {
+    /**
+     * True when merging the backup with manifest [m] could add nothing: every device counter in
+     * its version vector is one this phone's log already reaches (each phone's events reach a
+     * log as a whole prefix, so the counter alone says which are there), and its legacy events
+     * are none, or the same set as merged from [phone] last time. Older manifests without the
+     * legacy fields, or from a newer format, say nothing here: they are read in full.
+     */
+    private fun nothingNew(m: Manifest, phone: String, s: BackupState): Boolean {
+        if (m.format > BackupArchive.FORMAT || m.deviceId != phone) return false
+        val legacyKnown = when (val n = m.legacyCount) {
+            null -> false
+            0L -> true
+            else -> n > 0 && m.legacyDigest != null && m.legacyDigest == s.mergedLegacy[phone]
+        }
+        if (!legacyKnown) return false
+        val local = fermata.loggedHeads()
+        return m.heads.all { (device, counter) -> counter <= (local[device] ?: 0L) }
+    }
+
+    private fun remember(phone: String, sha: String?, legacyDigest: String?) {
         val s = state.load()
-        state.save(s.copy(merged = s.merged + (phone to sha)))
+        state.save(
+            s.copy(
+                merged = if (sha != null) s.merged + (phone to sha) else s.merged,
+                mergedLegacy = if (legacyDigest != null) s.mergedLegacy + (phone to legacyDigest) else s.mergedLegacy,
+            )
+        )
     }
 
     private fun recordResult(result: BackupResult) {
@@ -407,7 +546,21 @@ class FolderBackups(
     }
 
     companion object {
-        /** One backup, restore or merge at a time, across every instance in the process. */
+        /** `previous` moves on at most this often (a day); `latest` is replaced on every backup. */
+        const val PREVIOUS_EVERY_MS = 24L * 60 * 60 * 1000
+
+        /** How far the clock may go back before `previous` moves on anyway (see [previousDue]). */
+        private const val CLOCK_SLACK_MS = 60L * 60 * 1000
+
+        /** Marks the temp name of a parked old `latest` (`minim-<device>-<time>-<nonce>-old.tmp`). */
+        private const val PARKED = "-old"
+        private const val PARKED_SUFFIX = PARKED + BackupNames.TEMP_EXTENSION
+
+        /**
+         * One backup, restore or merge at a time, across every instance in the process: the
+         * on-close backup, the daily job and "Back up now" wait for each other, whichever thread
+         * or WorkManager job runs them.
+         */
         private val LOCK = Any()
         private val random = SecureRandom()
 

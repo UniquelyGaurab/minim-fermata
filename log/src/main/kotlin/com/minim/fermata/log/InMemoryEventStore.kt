@@ -34,6 +34,8 @@ class InMemoryEventStore(initial: Iterable<Event> = emptyList()) : EventStore {
 
     override fun heads(): Map<String, Long> = synchronized(lock) { HashMap(heads) }
 
+    override fun loggedHeads(): Map<String, Long> = synchronized(lock) { EventLog.heads(byId.values) }
+
     /** Heads stay where they were: a counter once used is never handed out again. */
     override fun removeAll(ids: Collection<EventId>): Int = synchronized(lock) {
         var removed = 0

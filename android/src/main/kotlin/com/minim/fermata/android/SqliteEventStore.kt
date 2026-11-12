@@ -92,6 +92,15 @@ class SqliteEventStore private constructor(
         return heads
     }
 
+    override fun loggedHeads(): Map<String, Long> {
+        val heads = HashMap<String, Long>()
+        db.rawQuery(
+            "SELECT device, MAX(counter) FROM $table WHERE device != ? GROUP BY device",
+            arrayOf(EventId.LEGACY_DEVICE),
+        ).use { c -> while (c.moveToNext()) heads[c.getString(0)] = c.getLong(1) }
+        return heads
+    }
+
     override fun maxTimestamp(): Long? =
         db.rawQuery("SELECT MAX(ts) FROM $table", null).use { c ->
             if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null

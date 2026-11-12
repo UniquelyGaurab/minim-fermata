@@ -27,6 +27,13 @@ interface EventStore {
     /** The highest counter stored per device, without the legacy pseudo-device. */
     fun heads(): Map<String, Long>
 
+    /**
+     * The highest counter per device among the events in the store now, without the legacy
+     * pseudo-device: what a backup's manifest records. Unlike [heads], counters kept only so they
+     * are never handed out again (from deleted or rolled-back events) are left out.
+     */
+    fun loggedHeads(): Map<String, Long> = EventLog.heads(all())
+
     /** The newest timestamp stored, or null when the store is empty. */
     fun maxTimestamp(): Long?
 

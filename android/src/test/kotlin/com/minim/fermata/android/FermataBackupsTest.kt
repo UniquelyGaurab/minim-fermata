@@ -56,6 +56,10 @@ class TestApp : Application(), FermataHolder {
     override val appVersion: String = "5.10.0-test"
     var onBeforeBackup: () -> Unit = {}
     override fun beforeBackup() = onBeforeBackup()
+    var changed = 0
+    override fun onFermataChanged() {
+        changed++
+    }
 }
 
 private class StepClock(var now: Long) : Clock() {
@@ -420,6 +424,124 @@ class FermataBackupsTest {
         val next = state.copy(status = state.status.copy(lastError = null, lastErrorMessage = null), merged = mapOf("phoneB" to "x"))
         store.save(next)
         assertEquals(next, store.load())
+
+        // The daily previous and the manifest-first merge keep their state too.
+        val auto = next.copy(previousRotatedAt = 1_794_355_200_000L, mergedLegacy = mapOf("phoneB" to "d1", "phoneC" to "d2"))
+        store.save(auto)
+        assertEquals(auto, PrefsBackupStateStore(prefs).load())
+        val fewer = auto.copy(previousRotatedAt = null, mergedLegacy = mapOf("phoneC" to "d3"))
+        store.save(fewer)
+        assertEquals(fewer, PrefsBackupStateStore(prefs).load())
+    }
+
+    @Test
+    fun theOnCloseBackupIsExpeditedReplacesAWaitingOneAndWritesOnlyWhenChanged() {
+        val (f, _) = phone("phoneA")
+        val app = context as TestApp
+        app.holder = f
+        var prepared = 0
+        app.onBeforeBackup = { prepared++ }
+        val backups = FermataBackups(context, f)
+        val wm = holdingWorkManager()
+        assertNull(backups.enqueueBackupOnBackground(), "no folder: nothing queued")
+        assertTrue(wm.getWorkInfosForUniqueWork(FermataBackups.ON_CLOSE_WORK).get().isEmpty())
+
+        backups.setFolder(TestDocumentsProvider.tree)
+        f.plays(a)
+        val first = assertNotNull(backups.enqueueBackupOnBackground())
+        val second = assertNotNull(backups.enqueueBackupOnBackground())
+        val infos = wm.getWorkInfosForUniqueWork(FermataBackups.ON_CLOSE_WORK).get()
+        assertEquals(listOf(second), infos.map { it.id }, "the newer close replaces the one still waiting or running")
+        assertTrue(wm.getWorkInfoById(first).get().let { it == null || it.state == WorkInfo.State.CANCELLED })
+
+        fun onClose() = TestListenableWorkerBuilder<BackupWorker>(context)
+            .setInputData(androidx.work.workDataOf(BackupWorker.MODE to BackupWorker.MODE_ON_CLOSE)).build().doWork()
+        assertEquals(ListenableWorker.Result.success(), onClose())
+        assertEquals(1, prepared, "batched history is recorded first")
+        assertEquals(listOf("minim-phoneA-latest.minim"), names())
+        val modified = File(dir, "minim-phoneA-latest.minim").lastModified()
+        val bytes = File(dir, "minim-phoneA-latest.minim").readBytes()
+
+        Thread.sleep(20)
+        assertEquals(ListenableWorker.Result.success(), onClose())
+        assertTrue(bytes.contentEquals(File(dir, "minim-phoneA-latest.minim").readBytes()), "nothing changed: nothing written")
+        assertEquals(modified, File(dir, "minim-phoneA-latest.minim").lastModified())
+        assertNull(backups.status().lastMergeAt, "the on-close job does not merge")
+
+        f.plays(b)
+        assertEquals(ListenableWorker.Result.success(), onClose())
+        assertEquals(2L, read("minim-phoneA-latest.minim").manifest.eventCount)
+        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
+        assertTrue(backups.status().ok)
+    }
+
+    @Test
+    fun theOnOpenMergeIsQueuedOnceAndOnlyMerges() {
+        val (other, _) = phone("phoneB")
+        other.plays(a, b)
+        FermataBackups(context, other).apply { setFolder(TestDocumentsProvider.tree); backUpNow() }
+
+        val (f, _) = phone("phoneA")
+        val app = context as TestApp
+        app.holder = f
+        val backups = FermataBackups(context, f)
+        val wm = holdingWorkManager()
+        val first = assertNotNull(backups.enqueueMergeOnOpen())
+        backups.enqueueMergeOnOpen()
+        assertEquals(first, wm.getWorkInfosForUniqueWork(FermataBackups.MERGE_WORK).get().single().id, "one at a time")
+
+        fun onOpen() = TestListenableWorkerBuilder<BackupWorker>(context)
+            .setInputData(androidx.work.workDataOf(BackupWorker.MODE to BackupWorker.MODE_MERGE)).build().doWork()
+        app.changed = 0
+        assertEquals(ListenableWorker.Result.success(), onOpen())
+        assertEquals(2L, f.eventCount())
+        assertEquals(1, app.changed, "the app is told the log changed")
+        assertEquals(listOf("minim-phoneB-latest.minim"), names(), "the on-open job does not back up")
+
+        assertEquals(ListenableWorker.Result.success(), onOpen())
+        assertEquals(1, app.changed, "nothing new: not told again")
+        assertFalse(backups.status().mergeTroubled)
+    }
+
+    @Test
+    fun expeditedJobsFallBackWhenOutOfQuotaAndAreOrdinaryWorkBeforeAndroid12() {
+        val s = FermataBackups.expedited(BackupWorker.MODE_ON_CLOSE, sdk = 31).workSpec
+        assertTrue(s.expedited)
+        assertEquals(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST, s.outOfQuotaPolicy)
+        assertEquals(BackupWorker.MODE_ON_CLOSE, s.input.getString(BackupWorker.MODE))
+        assertFalse(FermataBackups.expedited(BackupWorker.MODE_ON_CLOSE, sdk = 30).workSpec.expedited)
+        assertFalse(s.constraints.requiresCharging(), "no constraints: an expedited job can't have them")
+    }
+
+    @Test
+    fun dailyAndStartupJobsSkipTheWriteWhenNothingChangedButBackUpNowAlwaysWrites() {
+        val (f, _) = phone("phoneA")
+        (context as TestApp).holder = f
+        val backups = FermataBackups(context, f)
+        backups.setFolder(TestDocumentsProvider.tree)
+        f.plays(a)
+        backups.backUpNow()
+        val bytes = File(dir, "minim-phoneA-latest.minim").readBytes()
+        assertEquals(ListenableWorker.Result.success(), TestListenableWorkerBuilder<BackupWorker>(context).build().doWork())
+        assertTrue(bytes.contentEquals(File(dir, "minim-phoneA-latest.minim").readBytes()), "daily: unchanged, not written")
+        assertEquals(listOf("minim-phoneA-latest.minim"), names())
+
+        assertEquals(
+            ListenableWorker.Result.success(),
+            TestListenableWorkerBuilder<BackupWorker>(context)
+                .setInputData(androidx.work.workDataOf(BackupWorker.MODE to BackupWorker.MODE_NOW)).build().doWork(),
+        )
+        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names(), "Back up now writes anyway")
+    }
+
+    /** A WorkManager that starts jobs but never runs their work, so queued jobs stay put. */
+    private fun holdingWorkManager(): WorkManager {
+        val config = androidx.work.Configuration.Builder()
+            .setExecutor { /* held: the work never runs */ }
+            .setTaskExecutor(androidx.work.testing.SynchronousExecutor())
+            .build()
+        WorkManagerTestInitHelper.initializeTestWorkManager(context, config)
+        return WorkManager.getInstance(context)
     }
 
     // --- helpers ---

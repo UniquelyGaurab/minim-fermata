@@ -466,6 +466,12 @@ class Fermata(
     /** The version vector of this log: highest counter per device. */
     fun heads(): Map<String, Long> = store.heads()
 
+    /**
+     * The version vector of the events in the log now, as a backup's manifest records it: like
+     * [heads], but without counters kept only from deleted or rolled-back events.
+     */
+    fun loggedHeads(): Map<String, Long> = store.loggedHeads()
+
     /** Events a peer with version vector [heads] has not seen yet. */
     fun eventsAfter(heads: Map<String, Long>): List<Event> = store.after(heads)
 

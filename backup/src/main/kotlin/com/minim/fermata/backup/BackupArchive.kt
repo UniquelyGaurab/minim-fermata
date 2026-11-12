@@ -1,6 +1,7 @@
 package com.minim.fermata.backup
 
 import com.minim.fermata.log.Event
+import com.minim.fermata.log.EventId
 import com.minim.fermata.log.EventLog
 import com.minim.fermata.log.FermataInfo
 import kotlinx.serialization.json.Json
@@ -37,6 +38,14 @@ data class Manifest(
     /** Highest counter per device in the backup, so a sync can tell what is new at a glance. */
     val heads: Map<String, Long>,
     val files: List<BackupFileEntry>,
+    /**
+     * How many legacy events (imported from Minim's old tables, see `EventId.legacy`) the backup
+     * holds, and a SHA-256 of their sorted ids. Legacy ids are hashes, so [heads] cannot show
+     * them; with these a merge can still tell from the manifest alone that nothing is new.
+     * Null in older backups; a merge then reads the whole file. Older readers ignore both.
+     */
+    val legacyCount: Long? = null,
+    val legacyDigest: String? = null,
 ) {
     fun toJson(): JsonObject = buildJsonObject {
         put("format", format)
@@ -46,6 +55,8 @@ data class Manifest(
         appVersion?.let { put("appVersion", it) }
         put("eventCount", eventCount)
         put("heads", buildJsonObject { heads.toSortedMap().forEach { (k, v) -> put(k, v) } })
+        legacyCount?.let { put("legacyCount", it) }
+        legacyDigest?.let { put("legacyDigest", it) }
         put("files", buildJsonArray {
             files.forEach { f ->
                 add(buildJsonObject { put("name", f.name); put("sha256", f.sha256); put("bytes", f.bytes) })
@@ -70,6 +81,8 @@ data class Manifest(
                     f.getValue("bytes").jsonPrimitive.long,
                 )
             },
+            legacyCount = (o["legacyCount"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull(),
+            legacyDigest = (o["legacyDigest"] as? JsonPrimitive)?.contentOrNull,
         )
     }
 }
@@ -120,6 +133,8 @@ object BackupArchive {
             eventCount = log.size.toLong(),
             heads = EventLog.heads(log),
             files = listOf(BackupFileEntry(EVENTS, sha256(eventBytes), eventBytes.size.toLong())),
+            legacyCount = log.count { it.id.device == EventId.LEGACY_DEVICE }.toLong(),
+            legacyDigest = legacyDigest(log),
         )
         val zip = ZipOutputStream(out)
         zip.putNextEntry(ZipEntry(MANIFEST))
@@ -194,6 +209,16 @@ object BackupArchive {
             throw BackupException("expected ${manifest.eventCount} events, found ${events.size}")
         }
         return Backup(manifest, events)
+    }
+
+    /**
+     * The SHA-256 of the sorted ids of the legacy events in [events] (one id per line), as the
+     * manifest's `legacyDigest` records it. The same set of legacy events gives the same digest.
+     */
+    fun legacyDigest(events: Iterable<Event>): String {
+        val ids = events.filter { it.id.device == EventId.LEGACY_DEVICE }.map { it.id.counter }.distinct().sorted()
+        val text = ids.joinToString("\n")
+        return sha256(text.toByteArray(Charsets.UTF_8))
     }
 
     /** The SHA-256 of the event log inside a backup, as its manifest records it, or null. */

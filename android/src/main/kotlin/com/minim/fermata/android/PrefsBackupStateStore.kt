@@ -27,7 +27,10 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
         val merged = prefs.all.entries
             .filter { it.key.startsWith(K_MERGED_PREFIX) && it.value is String }
             .associate { it.key.removePrefix(K_MERGED_PREFIX) to it.value as String }
-        BackupState(status, merged, prefs.getBoolean(K_DISMISSED, false))
+        val mergedLegacy = prefs.all.entries
+            .filter { it.key.startsWith(K_MERGED_LEGACY_PREFIX) && it.value is String }
+            .associate { it.key.removePrefix(K_MERGED_LEGACY_PREFIX) to it.value as String }
+        BackupState(status, merged, prefs.getBoolean(K_DISMISSED, false), long(K_ROTATED), mergedLegacy)
     }
 
     override fun save(state: BackupState) = synchronized(this) {
@@ -47,7 +50,10 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
         if (s.lastMergeProblem == null) e.remove(K_MERGE_PROBLEM) else e.putString(K_MERGE_PROBLEM, s.lastMergeProblem)
         for (key in prefs.all.keys) if (key.startsWith(K_MERGED_PREFIX)) e.remove(key)
         for ((device, sha) in state.merged) e.putString(K_MERGED_PREFIX + device, sha)
+        for (key in prefs.all.keys) if (key.startsWith(K_MERGED_LEGACY_PREFIX)) e.remove(key)
+        for ((device, digest) in state.mergedLegacy) e.putString(K_MERGED_LEGACY_PREFIX + device, digest)
         e.putBoolean(K_DISMISSED, state.restoreOfferDismissed)
+        putLong(e, K_ROTATED, state.previousRotatedAt)
         e.commit()
         Unit
     }
@@ -71,5 +77,8 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
         const val K_MERGE_PROBLEM = "last_merge_problem"
         const val K_DISMISSED = "restore_offer_dismissed"
         const val K_MERGED_PREFIX = "merged."
+        // Not under "merged.": that prefix holds only the event log checksums.
+        const val K_MERGED_LEGACY_PREFIX = "merged_legacy."
+        const val K_ROTATED = "previous_rotated_at"
     }
 }
