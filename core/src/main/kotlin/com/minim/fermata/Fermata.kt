@@ -193,26 +193,63 @@ class Fermata(
     fun importEvents(events: Iterable<Event>): Int = mergeAs(events, ChangeOrigin.IMPORT)
 
     private fun mergeAs(events: Iterable<Event>, origin: ChangeOrigin): Int {
-        val change: Change
-        val added: Int
+        var change: Change? = null
+        var added = 0
         synchronized(lock) {
             val incoming = events.toList()
-            val pruned = applyClears(incoming)
-            val local = clearedBefore()
-            val candidates = if (local == null) incoming else incoming.filterNot { EventLog.isCleared(it, local) }
-            val fresh = if (listeners.isEmpty()) emptyList() else candidates.filterNot { store.contains(it.id) }.distinctBy { it.id }
-            added = store.appendAll(candidates)
-            if (pruned) invalidate()
-            if (added > 0) {
-                store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
-                // Events of this device that came back (its own rows imported, say) move the counter on.
-                store.heads()[deviceId]?.let { if (it > counter) counter = it }
+            val apply = applier
+            try {
+                store.inTransaction {
+                    val pruned = applyClears(incoming)
+                    val local = clearedBefore()
+                    val candidates = if (local == null) incoming else incoming.filterNot { EventLog.isCleared(it, local) }
+                    val fresh = if (listeners.isEmpty() && apply == null) emptyList()
+                    else candidates.filterNot { store.contains(it.id) }.distinctBy { it.id }
+                    added = store.appendAll(candidates)
+                    if (added > 0) {
+                        store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
+                        // Events of this device that came back (its own rows imported, say) move the counter on.
+                        store.heads()[deviceId]?.let { if (it > counter) counter = it }
+                    }
+                    if (pruned || added > 0) invalidate()
+                    val c = Change(origin, fresh, historyCleared = pruned)
+                    if (apply != null && (added > 0 || pruned)) apply(c)
+                    change = c
+                }
+            } catch (t: Throwable) {
+                // The store transaction rolled back: the log is as it was, so is anything the
+                // applier wrote. The counter and clock only move forward; nothing is reused.
+                clearPointRead = false
                 invalidate()
+                throw t
             }
-            change = Change(origin, fresh, historyCleared = pruned)
         }
-        if (added > 0 || change.historyCleared) notify(change)
+        val c = change!!
+        if (added > 0 || c.historyCleared) notify(c)
         return added
+    }
+
+    @Volatile private var applier: ((Change) -> Unit)? = null
+
+    /**
+     * Sets the code that brings a merge, import or restore into the app's own tables. Unlike a
+     * listener it runs inside Fermata's lock and inside the store transaction that adds the
+     * events ([EventStore.inTransaction]), after they are added, so with a store kept in the
+     * app's database (`SqliteEventStore.inDatabase`) the log and the app's tables are saved
+     * together: a kill leaves both or neither. If it throws, the merge, import or restore throws
+     * and nothing of it is kept, so the next one brings the same events again. It may call
+     * [record]. Null removes it.
+     */
+    fun setApplier(applier: ((Change) -> Unit)?) { this.applier = applier }
+
+    /**
+     * Makes sure [record] never hands out an id of this phone at or below [counter]. For ids the
+     * app knows are taken before they reach the log, such as 5.9.0's `fermata_events` rows that
+     * a later import brings in under their own ids: a write before that import would otherwise
+     * take one of them, and the import would then drop the old row as already seen.
+     */
+    fun reserveCountersThrough(counter: Long) = synchronized(lock) {
+        if (counter > this.counter) this.counter = counter
     }
 
     /** Where a batch of new events came from; see [addListener]. */
@@ -261,6 +298,9 @@ class Fermata(
      *
      * Restored events keep their own ids. This phone keeps [deviceId]; if the backup holds events
      * with this phone's id, the counter moves past the highest of them so no id is reused.
+     *
+     * The [setApplier] code runs inside the same store transaction, so the app's tables are
+     * restored together with the log; if it throws, the restore throws and nothing is kept.
      */
     fun restore(events: List<Event>): RestoreStats {
         val stats = restoreLocked(events)
@@ -277,16 +317,26 @@ class Fermata(
             dryModel.apply(e)
         }
         dryRun.snapshot()
-        // A history clear on either side wins: this phone's clear is kept, and the backup's
-        // history from before it is not written back.
-        val point = listOfNotNull(clearedBefore(), EventLog.clearedBefore(events)).maxOrNull()
-        val added = store.appendAll(if (point == null) events else events.filterNot { EventLog.isCleared(it, point) })
-        applyClears(events)
-        store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
-        store.heads()[deviceId]?.let { if (it > counter) counter = it }
-        invalidate()
-        built()
-        RestoreStats(added, events.size)
+        val apply = applier
+        try {
+            store.inTransaction {
+                // A history clear on either side wins: this phone's clear is kept, and the backup's
+                // history from before it is not written back.
+                val point = listOfNotNull(clearedBefore(), EventLog.clearedBefore(events)).maxOrNull()
+                val added = store.appendAll(if (point == null) events else events.filterNot { EventLog.isCleared(it, point) })
+                applyClears(events)
+                store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
+                store.heads()[deviceId]?.let { if (it > counter) counter = it }
+                invalidate()
+                apply?.invoke(Change(ChangeOrigin.RESTORE, emptyList(), historyCleared = true))
+                built()
+                RestoreStats(added, events.size)
+            }
+        } catch (t: Throwable) {
+            clearPointRead = false
+            invalidate()
+            throw t
+        }
     }
 
     /**
@@ -332,12 +382,21 @@ class Fermata(
      * restores this event drops the same history, whichever order things arrive in. Likes,
      * playlists and "not interested" stay.
      */
-    fun clearHistory(): Event = synchronized(lock) {
-        val before = timestamp()
-        val event = record(EventBody.HistoryClear(before))
-        clearPoint = maxOf(clearPoint ?: before, before)
+    fun clearHistory(): Event = clearHistory(Long.MAX_VALUE)!!
+
+    /**
+     * Records a history clear at [before] (capped at now), for a clear that reached the app some
+     * other way, such as from Firestore. Returns null, recording nothing, when the log already
+     * has a clear at or after [before].
+     */
+    fun clearHistory(before: Long): Event? = synchronized(lock) {
+        val now = timestamp()
+        val point = minOf(before, now)
+        if (before != Long.MAX_VALUE) clearedBefore()?.let { if (it >= point) return null }
+        val event = record(EventBody.HistoryClear(point), at = now)
+        clearPoint = maxOf(clearPoint ?: point, point)
         clearPointRead = true
-        store.removeHistoryBefore(before)
+        store.removeHistoryBefore(point)
         invalidate()
         event
     }

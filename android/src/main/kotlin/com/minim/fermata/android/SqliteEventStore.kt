@@ -51,6 +51,18 @@ class SqliteEventStore private constructor(
         return added
     }
 
+    override fun <T> inTransaction(block: () -> T): T {
+        val database = db
+        database.beginTransaction()
+        try {
+            val result = block()
+            database.setTransactionSuccessful()
+            return result
+        } finally {
+            database.endTransaction()
+        }
+    }
+
     override fun all(): List<Event> =
         db.rawQuery("SELECT json FROM $table ORDER BY ts, device, counter", null).use { c ->
             val events = ArrayList<Event>(c.count)

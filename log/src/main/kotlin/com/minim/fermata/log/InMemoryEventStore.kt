@@ -45,5 +45,26 @@ class InMemoryEventStore(initial: Iterable<Event> = emptyList()) : EventStore {
         removed
     }
 
+    private var depth = 0
+
+    /** All or nothing like a database transaction: if [block] throws, the store is put back. */
+    override fun <T> inTransaction(block: () -> T): T = synchronized(lock) {
+        val saved = if (depth == 0) Triple(HashMap(byId), TreeSet(ordered), HashMap(heads)) else null
+        depth++
+        try {
+            block()
+        } catch (t: Throwable) {
+            if (saved != null) {
+                byId.clear(); byId.putAll(saved.first)
+                ordered.clear(); ordered.addAll(saved.second)
+                // heads keep any counter used meanwhile: a counter is never handed out twice
+                for ((d, c) in saved.third) if ((heads[d] ?: Long.MIN_VALUE) < c) heads[d] = c
+            }
+            throw t
+        } finally {
+            depth--
+        }
+    }
+
     override fun maxTimestamp(): Long? = synchronized(lock) { if (ordered.isEmpty()) null else ordered.last().timestamp }
 }

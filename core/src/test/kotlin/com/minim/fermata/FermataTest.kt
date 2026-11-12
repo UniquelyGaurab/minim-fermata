@@ -316,4 +316,100 @@ class FermataTest {
         assertEquals(3L, next.id.counter)
         assertEquals(setOf("A", "B"), f.library().likedTracks.map { it.track.id }.toSet())
     }
+
+    // ---- review fixes: reserved counters and the applier -------------------------------------
+
+    @Test
+    fun `a write before the import of 5_9_0 rows does not take their ids`() {
+        val clock = ManualClock(T0)
+        val f = fermata("phone", clock)
+        f.reserveCountersThrough(3)
+        clock.now += MINUTE
+        val like = f.record(EventBody.Like(Subject.Track(a)))
+        assertEquals(4L, like.id.counter)
+        // the import brings the old rows under their own ids: all three are kept
+        val old = (1L..3L).map { n ->
+            com.minim.fermata.log.Event(EventId("phone", n), com.minim.fermata.log.EventContext.at(T0 - n * HOUR, ZoneOffset.UTC, "s", null, Source.IMPORT), EventBody.Play(b, 60_000))
+        }
+        assertEquals(3, f.importEvents(old))
+        assertEquals(3, f.library().history.size)
+        f.reserveCountersThrough(2) // never moves back
+        clock.now += MINUTE
+        assertEquals(5L, f.record(EventBody.Unlike(Subject.Track(a))).id.counter)
+    }
+
+    @Test
+    fun `when the applier throws, the merge keeps nothing and the next merge brings it again`() {
+        val clock = ManualClock(T0)
+        val other = fermata("other", ManualClock(T0))
+        other.record(EventBody.Like(Subject.Track(a)))
+        other.record(EventBody.Play(b, 120_000))
+        val store = InMemoryEventStore()
+        val f = fermata("phone", clock, store)
+        f.record(EventBody.Like(Subject.Track(c)))
+        var fail = true
+        val applied = mutableListOf<Fermata.Change>()
+        val heard = mutableListOf<Fermata.Change>()
+        f.setApplier { ch ->
+            // runs after the events are in: the projections already include them
+            assertTrue(f.library().isLiked("A"))
+            if (fail) throw IllegalStateException("killed")
+            applied += ch
+            f.record(EventBody.Like(Subject.Track(b))) // the applier may record
+        }
+        f.addListener { heard += it }
+        val failed = runCatching { f.merge(other.events()) }
+        assertTrue(failed.isFailure)
+        assertEquals(1L, f.eventCount())
+        assertFalse(f.library().isLiked("A"))
+        assertTrue(heard.isEmpty())
+
+        fail = false
+        assertEquals(2, f.merge(other.events()))
+        assertEquals(1, applied.size)
+        assertEquals(setOf("other"), applied.single().added.map { it.id.device }.toSet())
+        assertEquals(1, heard.size)
+        assertTrue(f.library().isLiked("A"))
+        assertTrue(f.library().isLiked("B"))
+        val ids = f.events().map { it.id }
+        assertEquals(ids.size, ids.toSet().size)
+        // nothing new: the applier is not called
+        assertEquals(0, f.merge(other.events()))
+        assertEquals(1, applied.size)
+    }
+
+    @Test
+    fun `when the applier throws during a restore, the log is as it was`() {
+        val other = fermata("other", ManualClock(T0))
+        other.record(EventBody.Like(Subject.Track(a)))
+        val f = fermata("phone", ManualClock(T0 + MINUTE))
+        f.record(EventBody.Like(Subject.Track(c)))
+        var fail = true
+        var restored = 0
+        f.setApplier { ch ->
+            assertEquals(Fermata.ChangeOrigin.RESTORE, ch.origin)
+            if (fail) throw IllegalStateException("killed")
+            restored++
+        }
+        assertTrue(runCatching { f.restore(other.events()) }.isFailure)
+        assertEquals(1L, f.eventCount())
+        assertFalse(f.library().isLiked("A"))
+        fail = false
+        f.restore(other.events())
+        assertEquals(1, restored)
+        assertTrue(f.library().isLiked("A"))
+        f.setApplier(null)
+    }
+
+    @Test
+    fun `the in-memory store puts itself back when its transaction throws, keeping used counters`() {
+        val store = InMemoryEventStore()
+        val f = fermata("phone", ManualClock(T0))
+        val e = f.record(EventBody.Like(Subject.Track(a)))
+        store.append(e)
+        val extra = e.copy(id = EventId("phone", 9))
+        assertTrue(runCatching { store.inTransaction { store.append(extra); error("killed") } }.isFailure)
+        assertEquals(1L, store.count())
+        assertFalse(store.contains(extra.id))
+    }
 }

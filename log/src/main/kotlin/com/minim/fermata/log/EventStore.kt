@@ -44,6 +44,14 @@ interface EventStore {
     /** The newest [EventBody.HistoryClear] point stored, or null. */
     fun clearedBefore(): Long? = EventLog.clearedBefore(all())
 
+    /**
+     * Runs [block] in one store transaction: everything [block] writes to the store (and, for a
+     * store kept inside an app's own database, to the app's tables) commits together or not at
+     * all. Nested calls join the outer transaction. The default just runs [block], for stores that
+     * cannot undo a write; [InMemoryEventStore] puts itself back if [block] throws.
+     */
+    fun <T> inTransaction(block: () -> T): T = block()
+
     /** Events a peer with version vector [heads] has not seen. */
     fun after(heads: Map<String, Long>): List<Event> = EventLog.after(all(), heads)
 }
