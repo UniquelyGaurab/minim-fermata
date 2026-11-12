@@ -70,6 +70,9 @@ class FermataRecs internal constructor(
     /** True when [warmUp] has work to do: no model yet, or one that missed a merge. */
     fun needsWarmUp(): Boolean = synchronized(lock) { model == null || stale }
 
+    /** The model being served, for tests. */
+    internal fun modelForTest(): TasteModel? = synchronized(lock) { model }
+
     /**
      * Builds the model if it is missing or stale. Blocking, and safe from any thread except
      * while holding Fermata's write lock; run it on a background thread. Concurrent callers wait

@@ -46,7 +46,11 @@ data class RecsConfig(
 
     // ---- recommendations (Recommender) ----
 
-    /** Cold start: fewer counted plays than this, or fewer distinct tracks played, and apps keep their own order. */
+    /**
+     * Cold start: fewer counted plays than this, or fewer distinct tracks played, and apps keep
+     * their own order. A counted play is heard past the early-skip point ([heardPastEarlyPoint])
+     * and for [countedPlayMs] or half the track.
+     */
     val coldStartMinPlays: Int = 30,
     val coldStartMinTracks: Int = 10,
     /**
@@ -82,6 +86,13 @@ data class RecsConfig(
     /** Where a skip stops being early, for a track of [durationMs] (0: unknown). */
     fun earlySkipPointMs(durationMs: Long): Long =
         if (durationMs > 0) maxOf(earlySkipMs, (durationMs * earlySkipFraction).toLong()) else earlySkipMs
+
+    /**
+     * Whether a play of [listenedMs] counts at all for taste: heard past the early-skip point, or
+     * (for a song shorter than that point) to nearly its end. A shorter play is an early skip.
+     */
+    fun heardPastEarlyPoint(listenedMs: Long, durationMs: Long): Boolean =
+        listenedMs >= earlySkipPointMs(durationMs) || (durationMs > 0 && listenedMs >= durationMs * 0.9)
 
     companion object {
         const val HOUR: Long = 60 * 60 * 1000L

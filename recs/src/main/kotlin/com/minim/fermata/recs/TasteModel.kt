@@ -103,11 +103,26 @@ class TasteModel(val config: RecsConfig = RecsConfig()) {
     private val likedArtists = HashSet<String>()
     private val notInterested = HashSet<String>()
 
+    /**
+     * What a like or a "not interested" added, so its undo (unlike, "interested") takes away
+     * exactly what is left of it after decay, and not the full weight again: [trackPart] went to
+     * the track's scores and [artistPart] to [artistKey]'s, all at [at]. A later "just a phase"
+     * or reset of the track or artist scales the parts the same way it scaled the scores.
+     */
+    private class Mark(val at: Long, var trackPart: Double, val artistKey: String?, var artistPart: Double)
+
+    /** Undoable likes and "not interested", by [Subject.key] and kind. */
+    private val likeMarks = HashMap<String, Mark>()
+    private val notInterestedMarks = HashMap<String, Mark>()
+
     /** Signals counted towards confidence (plays, skips, queues, likes). */
     var signals: Long = 0
         private set
 
-    /** Counted plays (heard [RecsConfig.countedPlayMs] or half the track) and distinct tracks counted. */
+    /**
+     * Counted plays (heard past the early-skip point, and [RecsConfig.countedPlayMs] or half the
+     * track) and distinct tracks counted.
+     */
     var countedPlays: Long = 0
         private set
     val countedTracks: Int get() = playedTracks
@@ -128,7 +143,10 @@ class TasteModel(val config: RecsConfig = RecsConfig()) {
         when (val b = event.body) {
             // A play row with nothing heard (Minim 5.9.0 writes one for every track that left the
             // player) says nothing about taste; a skip, if any, is its own event.
-            is EventBody.Play -> if (b.listenedMs > 0) {
+            // A play that stopped before the early-skip point is an early skip, not a play
+            // (Minim writes a play row as well as the skip): it counts nowhere, so the skip costs
+            // its full weight and plays, "last heard", On repeat and cold start agree.
+            is EventBody.Play -> if (b.listenedMs > 0 && config.heardPastEarlyPoint(b.listenedMs, b.track.durationMs)) {
                 signals++
                 val counted = b.listenedMs >= config.countedPlayMs ||
                     (b.track.durationMs > 0 && b.listenedMs >= b.track.durationMs / 2)
@@ -144,7 +162,7 @@ class TasteModel(val config: RecsConfig = RecsConfig()) {
                 }
                 if (t > s.lastHeardAt) s.lastHeardAt = t
                 // Heard past the early-skip point: the early-skip streak is over.
-                if (b.listenedMs >= config.earlySkipPointMs(b.track.durationMs)) s.earlySkipStreak = 0
+                s.earlySkipStreak = 0
                 addTrack(b.track, weight, t)
             }
             is EventBody.Skip -> {
@@ -174,18 +192,23 @@ class TasteModel(val config: RecsConfig = RecsConfig()) {
                 signals++
                 when (val s = b.subject) {
                     is Subject.Track -> if (likedTracks.add(s.track.id)) {
-                        addTrack(s.track, w.like, t)
+                        likeMarks[s.key] = addTrack(s.track, w.like, t)
                         stats(s.track).likedAt = t
                     }
-                    is Subject.Artist -> if (likedArtists.add(s.key)) addArtist(s.name, w.like, t)
+                    is Subject.Artist -> if (likedArtists.add(s.key)) likeMarks[s.key] = addArtist(s.name, w.like, t)
                 }
             }
             is EventBody.Unlike -> when (val s = b.subject) {
-                is Subject.Track -> if (likedTracks.remove(s.track.id)) addTrack(s.track, -w.like, t)
-                is Subject.Artist -> if (likedArtists.remove(s.key)) addArtist(s.name, -w.like, t)
+                is Subject.Track -> if (likedTracks.remove(s.track.id)) undo(likeMarks.remove(s.key), s, -w.like, t)
+                is Subject.Artist -> if (likedArtists.remove(s.key)) undo(likeMarks.remove(s.key), s, -w.like, t)
             }
-            is EventBody.NotInterested -> if (notInterested.add(b.subject.key)) addSubject(b.subject, w.notInterested, t)
-            is EventBody.Interested -> if (notInterested.remove(b.subject.key)) addSubject(b.subject, -w.notInterested, t)
+            // "Not interested" in a song lowers that song only, like a skip: not its artist.
+            is EventBody.NotInterested -> if (notInterested.add(b.subject.key)) {
+                notInterestedMarks[b.subject.key] = addSubject(b.subject, w.notInterested, t, artistShare = false)
+            }
+            is EventBody.Interested -> if (notInterested.remove(b.subject.key)) {
+                undo(notInterestedMarks.remove(b.subject.key), b.subject, -w.notInterested, t)
+            }
             is EventBody.TasteEdit -> when (b.kind) {
                 TasteEditKind.OVER_IT -> addSubject(b.subject, w.overIt, t, artistShare = false)
                 TasteEditKind.JUST_A_PHASE -> scale(b.subject, w.phaseFactor, t)
@@ -230,7 +253,7 @@ class TasteModel(val config: RecsConfig = RecsConfig()) {
         return artist.isNotBlank() && Subject.Artist(artist).key in notInterested
     }
 
-    /** When the track was last heard at all (any play with something heard), or null. */
+    /** When the track was last heard past the early-skip point, or null. */
     fun lastHeardAt(trackId: String): Long? = tracks[trackId]?.lastHeardAt?.takeIf { it != Long.MIN_VALUE }
 
     fun likedAt(trackId: String): Long? = tracks[trackId]?.likedAt?.takeIf { it != Long.MIN_VALUE }
@@ -295,30 +318,62 @@ class TasteModel(val config: RecsConfig = RecsConfig()) {
         return s
     }
 
-    private fun addTrack(track: TrackRef, weight: Double, t: Long, artistShare: Boolean = true) {
+    /** Adds [weight] to the track (and a share to its artist); returns what went where, for an undo. */
+    private fun addTrack(track: TrackRef, weight: Double, t: Long, artistShare: Boolean = true): Mark {
         val s = stats(track)
         s.score.add(weight, t)
         s.love.add(weight, t)
-        if (artistShare) artistKey(track)?.let { artistScores.getOrPut(it) { Decayed(config.halfLifeMs) }.add(weight * config.weights.artistShare, t) }
+        val key = if (artistShare) artistKey(track) else null
+        val part = if (key != null) weight * config.weights.artistShare else 0.0
+        if (key != null) artistScores.getOrPut(key) { Decayed(config.halfLifeMs) }.add(part, t)
+        return Mark(t, weight, key, part)
     }
 
-    private fun addArtist(name: String, weight: Double, t: Long) {
+    private fun addArtist(name: String, weight: Double, t: Long): Mark {
         val key = Subject.normalizeArtist(name)
         artistNames.putIfAbsent(key, name.trim())
         artistScores.getOrPut(key) { Decayed(config.halfLifeMs) }.add(weight, t)
+        return Mark(t, 0.0, key, weight)
     }
 
-    private fun addSubject(subject: Subject, weight: Double, t: Long, artistShare: Boolean = true) = when (subject) {
+    private fun addSubject(subject: Subject, weight: Double, t: Long, artistShare: Boolean = true): Mark = when (subject) {
         is Subject.Track -> addTrack(subject.track, weight, t, artistShare)
         is Subject.Artist -> addArtist(subject.name, weight, t)
     }
 
-    private fun scale(subject: Subject, factor: Double, t: Long) = when (subject) {
-        is Subject.Track -> stats(subject.track).let { it.score.scale(factor, t); it.love.scale(factor, t) }
-        is Subject.Artist -> {
-            val key = Subject.normalizeArtist(subject.name)
-            artistNames.putIfAbsent(key, subject.name.trim())
-            artistScores.getOrPut(key) { Decayed(config.halfLifeMs) }.scale(factor, t)
+    /**
+     * Takes back what [mark] added: the same parts, at the time they were added, so only what is
+     * left of them after decay goes. [fallback] at [t] only for a mark that was never kept.
+     */
+    private fun undo(mark: Mark?, subject: Subject, fallback: Double, t: Long) {
+        if (mark == null) {
+            addSubject(subject, fallback, t, artistShare = false)
+            return
+        }
+        if (subject is Subject.Track && mark.trackPart != 0.0) {
+            val s = stats(subject.track)
+            s.score.add(-mark.trackPart, mark.at)
+            s.love.add(-mark.trackPart, mark.at)
+        }
+        if (mark.artistKey != null && mark.artistPart != 0.0) {
+            artistScores.getOrPut(mark.artistKey) { Decayed(config.halfLifeMs) }.add(-mark.artistPart, mark.at)
+        }
+    }
+
+    private fun scale(subject: Subject, factor: Double, t: Long) {
+        when (subject) {
+            is Subject.Track -> {
+                stats(subject.track).let { it.score.scale(factor, t); it.love.scale(factor, t) }
+                likeMarks[subject.key]?.let { it.trackPart *= factor }
+                notInterestedMarks[subject.key]?.let { it.trackPart *= factor }
+            }
+            is Subject.Artist -> {
+                val key = Subject.normalizeArtist(subject.name)
+                artistNames.putIfAbsent(key, subject.name.trim())
+                artistScores.getOrPut(key) { Decayed(config.halfLifeMs) }.scale(factor, t)
+                for (m in likeMarks.values) if (m.artistKey == key) m.artistPart *= factor
+                for (m in notInterestedMarks.values) if (m.artistKey == key) m.artistPart *= factor
+            }
         }
     }
 
