@@ -357,6 +357,56 @@ class FermataBackupsTest {
     }
 
     @Test
+    fun aOneTimeBackupIsQueuedOnceAndCanReplaceThePreviousFile() {
+        val (f, _) = phone("phoneA")
+        val app = context as TestApp
+        app.holder = f
+        val backups = FermataBackups(context, f)
+        backups.setFolder(TestDocumentsProvider.tree)
+        f.plays(a)
+        backups.backUpNow()
+        clock.now += 86_400_000L
+        f.plays(b)
+        backups.backUpNow()
+        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
+
+        val wm = WorkManager.getInstance(context)
+        backups.enqueueBackupOnce()
+        backups.enqueueBackupOnce()
+        assertEquals(1, wm.getWorkInfosForUniqueWork(FermataBackups.ONCE_WORK).get().size, "a second plain one while one is queued does nothing")
+        val replacing = backups.enqueueBackupOnce(replacePrevious = true)
+        val infos = wm.getWorkInfosForUniqueWork(FermataBackups.ONCE_WORK).get()
+        assertEquals(replacing, infos.single { it.state != WorkInfo.State.CANCELLED }.id)
+
+        // the job itself, as WorkManager runs it after a clear
+        f.clearHistory()
+        val worker = TestListenableWorkerBuilder<BackupWorker>(context)
+            .setInputData(androidx.work.workDataOf(BackupWorker.REPLACE_PREVIOUS to true)).build()
+        assertEquals(ListenableWorker.Result.success(), worker.doWork())
+        val latest = read("minim-phoneA-latest.minim")
+        val previous = read("minim-phoneA-previous.minim")
+        assertEquals(latest.manifest.eventCount, previous.manifest.eventCount)
+        assertTrue(previous.events.none { it.body is EventBody.Play }, "the cleared plays are in neither file")
+    }
+
+    @Test
+    fun mergeProblemsRoundTripInTheSavedStatus() {
+        val prefs = context.getSharedPreferences("state-test-2", Context.MODE_PRIVATE)
+        val store = PrefsBackupStateStore(prefs)
+        val state = com.minim.fermata.sync.BackupState(
+            com.minim.fermata.sync.BackupStatus(
+                lastSuccessAt = 1, lastMergeAt = 2, lastMergeError = BackupError.FOLDER_ACCESS_LOST,
+                lastMergeProblemCount = 2, lastMergeProblem = "minim-phoneB-latest.minim: damaged",
+            ),
+            emptyMap(),
+        )
+        store.save(state)
+        assertEquals(state, PrefsBackupStateStore(prefs).load())
+        store.save(state.copy(status = state.status.copy(lastMergeError = null, lastMergeProblemCount = 0, lastMergeProblem = null)))
+        assertFalse(PrefsBackupStateStore(prefs).load().status.mergeTroubled)
+    }
+
+    @Test
     fun stateStoreRoundTrips() {
         val prefs = context.getSharedPreferences("state-test", Context.MODE_PRIVATE)
         val store = PrefsBackupStateStore(prefs)

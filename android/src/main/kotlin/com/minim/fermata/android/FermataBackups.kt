@@ -9,6 +9,7 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import androidx.work.workDataOf
 import androidx.work.Worker
 import androidx.work.WorkerParameters
 import com.minim.fermata.Fermata
@@ -107,6 +108,22 @@ class FermataBackups(
         return request.id
     }
 
+    /**
+     * A one-time backup as background work, for backups the app starts itself (at startup, or
+     * right after a history clear): WorkManager runs it once even if the app is closed or killed
+     * meanwhile, and retries it like the daily one. It merges the other phones' backups first.
+     * With [replacePrevious] (after a clear) it also replaces this phone's `previous` file; a
+     * request with it replaces one still queued, so the replacement is never lost to a plain one.
+     */
+    fun enqueueBackupOnce(replacePrevious: Boolean = false): UUID {
+        val request = OneTimeWorkRequestBuilder<BackupWorker>()
+            .setInputData(workDataOf(BackupWorker.REPLACE_PREVIOUS to replacePrevious))
+            .build()
+        val policy = if (replacePrevious) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP
+        WorkManager.getInstance(context).enqueueUniqueWork(ONCE_WORK, policy, request)
+        return request.id
+    }
+
     /** When the last backup worked, and whether the last attempt failed and why. */
     fun status(): BackupStatus = core.status()
 
@@ -150,7 +167,8 @@ class FermataBackups(
     fun dismissRestoreOffer() = core.dismissRestoreOffer()
 
     /** The daily job's work: merge, then back up. */
-    internal fun runScheduled(): Pair<MergeResult, BackupResult> = core.mergeAndBackUp(backupFolder())
+    internal fun runScheduled(replacePrevious: Boolean = false): Pair<MergeResult, BackupResult> =
+        core.mergeAndBackUp(backupFolder(), replacePrevious)
 
     /** The folder to use: null when none is set, one that reports lost access when the permission is gone. */
     private fun backupFolder(): BackupFolder? {
@@ -175,6 +193,7 @@ class FermataBackups(
         private const val KEY_TREE = "tree_uri"
         const val DAILY_WORK = "fermata-daily-backup"
         const val NOW_WORK = "fermata-backup-now"
+        const val ONCE_WORK = "fermata-backup-once"
         private const val RW = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
 
         internal fun dailyRequest() = PeriodicWorkRequestBuilder<BackupWorker>(1, TimeUnit.DAYS)
@@ -215,7 +234,8 @@ class BackupWorker(context: Context, params: WorkerParameters) : Worker(context,
     override fun doWork(): Result {
         val holder = applicationContext as? FermataHolder ?: return Result.failure()
         runCatching { holder.beforeBackup() }
-        val (merge, backup) = FermataBackups(applicationContext, holder.fermata, holder.appVersion).runScheduled()
+        val replace = inputData.getBoolean(REPLACE_PREVIOUS, false)
+        val (merge, backup) = FermataBackups(applicationContext, holder.fermata, holder.appVersion).runScheduled(replace)
         if (merge.eventsAdded > 0) runCatching { holder.onFermataChanged() }
         return when {
             backup is BackupResult.Success -> Result.success()
@@ -225,8 +245,10 @@ class BackupWorker(context: Context, params: WorkerParameters) : Worker(context,
         }
     }
 
-    private companion object {
-        const val MAX_RETRIES = 2
-        val NOT_RETRIED = setOf(BackupError.NO_FOLDER, BackupError.FOLDER_ACCESS_LOST)
+    companion object {
+        /** Input: also replace this phone's `previous` file (see [FermataBackups.enqueueBackupOnce]). */
+        const val REPLACE_PREVIOUS = "replace_previous"
+        private const val MAX_RETRIES = 2
+        private val NOT_RETRIED = setOf(BackupError.NO_FOLDER, BackupError.FOLDER_ACCESS_LOST)
     }
 }
