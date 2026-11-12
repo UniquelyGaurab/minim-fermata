@@ -98,6 +98,13 @@ class Fermata(
     private var clearPointRead = false
 
     /**
+     * Recommendations: a reordered radio, shelves and the cold-start check, from a taste model
+     * kept up to date as events are recorded. Built off the write lock by [FermataRecs.warmUp];
+     * requests never block. See [FermataRecs].
+     */
+    val recs: FermataRecs = FermataRecs(store, lock, clock, config)
+
+    /**
      * Records something that just happened on this phone. When [sessionId] is null Fermata keeps
      * the session itself (new session after [sessionGapMs] or more of silence); when
      * [previousTrackId] is null it fills in the track played or skipped before, within the
@@ -144,6 +151,7 @@ class Fermata(
             lastTrack = listenedTrack
         }
         applyLocal(event)
+        recs.recorded(event)
         event
     }
 
@@ -169,6 +177,7 @@ class Fermata(
         if (eventId.device == deviceId && eventId.counter > counter) counter = eventId.counter
         if (timestamp > lastTimestamp) lastTimestamp = timestamp
         applyLocal(event)
+        recs.recorded(event)
         event
     }
 
@@ -211,7 +220,11 @@ class Fermata(
                         // Events of this device that came back (its own rows imported, say) move the counter on.
                         store.heads()[deviceId]?.let { if (it > counter) counter = it }
                     }
-                    if (pruned || added > 0) invalidate()
+                    if (pruned || added > 0) {
+                        // Only taste events make the recommendations model stale.
+                        if (pruned || candidates.any { it.type in TasteModel.TYPES }) invalidate(dropRecs = pruned)
+                        else invalidateProjections()
+                    }
                     val c = Change(origin, fresh, historyCleared = pruned)
                     if (apply != null && (added > 0 || pruned)) apply(c)
                     change = c
@@ -220,7 +233,7 @@ class Fermata(
                 // The store transaction rolled back: the log is as it was, so is anything the
                 // applier wrote. The counter and clock only move forward; nothing is reused.
                 clearPointRead = false
-                invalidate()
+                invalidate(dropRecs = true)
                 throw t
             }
         }
@@ -327,14 +340,14 @@ class Fermata(
                 applyClears(events)
                 store.maxTimestamp()?.let { if (it > lastTimestamp) lastTimestamp = it }
                 store.heads()[deviceId]?.let { if (it > counter) counter = it }
-                invalidate()
+                invalidate(dropRecs = true)
                 apply?.invoke(Change(ChangeOrigin.RESTORE, emptyList(), historyCleared = true))
                 built()
                 RestoreStats(added, events.size)
             }
         } catch (t: Throwable) {
             clearPointRead = false
-            invalidate()
+            invalidate(dropRecs = true)
             throw t
         }
     }
@@ -354,7 +367,7 @@ class Fermata(
      */
     fun rolledBack() = synchronized(lock) {
         clearPointRead = false
-        invalidate()
+        invalidate(dropRecs = true)
     }
 
     fun <T> transaction(block: () -> T): T = synchronized(lock) {
@@ -397,7 +410,7 @@ class Fermata(
         clearPoint = maxOf(clearPoint ?: point, point)
         clearPointRead = true
         store.removeHistoryBefore(point)
-        invalidate()
+        invalidate(dropRecs = true)
         event
     }
 
@@ -415,7 +428,7 @@ class Fermata(
      * [incoming] that is newer). Safe to repeat; a no-op when nothing is covered. Returns true
      * when the clear point moved or anything was deleted.
      */
-    fun pruneCleared(): Boolean = synchronized(lock) { applyClears(emptyList()).also { if (it) invalidate() } }
+    fun pruneCleared(): Boolean = synchronized(lock) { applyClears(emptyList()).also { if (it) invalidate(dropRecs = true) } }
 
     private fun applyClears(incoming: List<Event>): Boolean {
         val local = clearedBefore()
@@ -516,16 +529,23 @@ class Fermata(
         val p = projector ?: return
         val m = model ?: return
         // A replacing event, or a legacy one that may already be replaced, needs the full rebuild.
-        if (event.ctx.replaces != null || event.id.device == EventId.LEGACY_DEVICE) return invalidate()
+        if (event.ctx.replaces != null || event.id.device == EventId.LEGACY_DEVICE) return invalidateProjections()
         if (p.apply(event)) {
             m.apply(event)
             librarySnapshot = null
         } else {
-            invalidate()
+            invalidateProjections()
         }
     }
 
-    private fun invalidate() {
+    /** Drops the projections. [dropRecs]: drop the recommendations model too (else it goes stale). */
+    private fun invalidate(dropRecs: Boolean = false) {
+        invalidateProjections()
+        recs.invalidate(dropRecs)
+    }
+
+    /** Only the library and taste projections (the recommendations model keeps its own rules, [FermataRecs.recorded]). */
+    private fun invalidateProjections() {
         projector = null
         model = null
         librarySnapshot = null

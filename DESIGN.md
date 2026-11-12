@@ -142,6 +142,7 @@ Built from the log and updated a little after every event. When the algorithm ch
 - **Fatigue** per track (how worn out a song is right now)
 - **Eras** (current and past phases, by artist and sound)
 - **Explore settings** (how adventurous you are, learned over time)
+- **Recommendation aggregates** (Minim 6.1): per track, when it was last heard, its newest counted plays, its early-skip streak and a long-memory "loved" score; per artist, counted plays and recent early skips; which tracks belong to which artist. All updated per event, so a request never scans the log.
 
 ## Backups and sync, without a server
 
@@ -275,6 +276,34 @@ Rules for the integration release:
 - **Uses:** reranking the radio queue, choosing and ordering Discover shelves, and new shelves like "Back in rotation" (rediscovery) and "Your current era".
 - **Reasons** show on long-press or in the song menu: "Because you", plus one line.
 
+## Recommendations (Minim 6.1)
+
+What Minim asks Fermata for, and how it stays fast. Code: `recs` (`Recommender`, `TasteModel`, `RecsConfig`) and `core` (`FermataRecs`, reached as `fermata.recs`).
+
+**Requests.** All take a time (`now`, Fermata's clock by default, so tests are deterministic) and none blocks:
+
+- `recs.radio(candidates)`: a radio batch from YouTube, reordered by the blend above. Leaves out tracks the person said "not interested" to (track or artist), tracks skipped early twice in a row (until heard past the early point again, or 60 days pass), and tracks heard in the last 3 hours. If that leaves fewer than 10, recently heard tracks come back at the end in YouTube's order. Returns `Reranked(picks, dropped)`, each drop with its reason.
+- `recs.rank(candidates)`: the same for a shelf, without the recent-play filter.
+- `recs.onRepeat()`: tracks counted 3 or more times in the last 7 days, most plays first.
+- `recs.forgottenFavourites()`: tracks liked, or counted 5 or more times, and not heard for 30 days, ordered by a slow-fading "loved" score (half-life 180 days). A like newer than 30 days does not count yet.
+- `recs.becauseYouLike()`: top artists by taste (liked, or 5 or more counted plays), each with the person's own best tracks of that artist as seeds for a mix.
+- `recs.state()`: `NOT_READY`, `COLD_START` or `READY`; `recs.heardRecently(id)`.
+
+**Cold start.** Fewer than 30 counted plays, or fewer than 10 distinct tracks counted: `radio` and `rank` return null and the shelves are empty, which means "keep your current behaviour". Past that, the blend uses the model's confidence but at least 0.5, so likes and skips show from the first days rather than after weeks (confidence alone stays near 0 for the first days).
+
+**Skips.** A skip is early before 30 seconds, or before 20% of a track whose length is known, whichever is later. An early skip adds −0.6 to the track (a late one −0.2) and nothing to the artist. Repeat skips touch the artist lightly: once an artist has 3 early skips within 14 days, each further early skip in that window (the third included) adds −0.4 to the artist, of which half reaches each of its tracks' scores.
+
+**Speed.**
+- The model is built once per process by `recs.warmUp()`, on a background thread, from the taste event types only (`EventStore.ofTypes`; the SQLite store reads the `type` column first and does not decode the rest). Building does not hold Fermata's lock: events recorded meanwhile are kept aside and applied after the read.
+- Every event this phone records is applied to the model as it is recorded (about a microsecond).
+- Until the model is built, every request returns null: the app shows what it has now.
+- A merge or import that brings taste events marks the model stale. It keeps serving and the next `warmUp()` rebuilds it. A history clear, restore or rolled-back transaction drops it, so cleared plays are never used.
+- Ranking a candidate list is linear in its length; the shelves walk the model's tracks once. Timings are in the test report (`RecsBenchmarkTest`, `SqliteEventStoreTest`).
+
+**Tunable numbers** (`RecsConfig`): `earlySkipMs` 30 000, `earlySkipFraction` 0.2, `recentWindowMs` 3 hours, `radioMinKeep` 10, `dropAfterEarlySkips` 2, `skipMemoryDays` 60, `artistSkipsBeforePenalty` 3, `artistSkipWindowDays` 14, `coldStartMinPlays` 30, `coldStartMinTracks` 10, `minWarmConfidence` 0.5, `onRepeatDays` 7, `onRepeatMinPlays` 3, `forgottenAfterDays` 30, `forgottenMinPlays` 5, `longHalfLifeDays` 180, `becauseMinArtistPlays` 5. Weights (`Weights`): counted play +1, finished +0.5 more, partial play +0.2, early skip −0.6, late skip −0.2, artist repeat skip −0.4, queued +1.5, like +3, not interested −6, over it −8, share to the artist 0.5. Scores halve every 30 days.
+
+No backup format change: everything here is derived from the log.
+
 ## The API
 
 ```kotlin
@@ -288,8 +317,12 @@ val library: LibraryState = fermata.library()   // likes, playlists, history, st
 // Listening (session and previous track are filled in when not given)
 fermata.record(EventBody.Play(track, listenedMs = 182_000), source = Source.RADIO)
 
-// Recommendations
-val picks: List<Pick> = fermata.rank(candidates)
+// Recommendations (see "Recommendations (Minim 6.1)")
+fermata.recs.warmUp()                            // blocking, background thread, once per process and after merges
+val radio: Reranked? = fermata.recs.radio(youtubeRadio)   // null: not ready or cold start, keep YouTube's order
+val shelf: Reranked? = fermata.recs.rank(shelfTracks)
+fermata.recs.onRepeat(); fermata.recs.forgottenFavourites(); fermata.recs.becauseYouLike()
+val picks: List<Pick> = fermata.rank(candidates)  // older: rebuilds from the whole log, no filters
 // Pick(track, score, reason = "You've played this 4 times")
 val taste: TasteView = fermata.taste()           // for the "your taste" screen
 fermata.edit(TasteEditKind.OVER_IT, Subject.Artist("Artist"))
@@ -328,7 +361,7 @@ fermata.importLegacy(EventBody.Play(track, 90_000), playedAt, legacyKey = "play|
 4. **Integrate into Minim:** Minim's tables become projections; the old tables are imported as historical events. *(In progress on Minim's `fermata-integration` branch, 5.10.0: every write goes through the log in the same transaction, the one-time import, playback events, merges and restores written back into the tables, Settings → Storage, the fresh-install offer, and clear history as a `history_clear` event. Not released.)*
 5. **Bridge release off Firebase:** pull Firestore down into the log, back up, sign out, delete the cloud copy.
 6. **Remove Firebase** entirely.
-7. **Recommendations:** context, co-play, fatigue, eras, rediscovery, explore, reasons and the taste screen; rerank the radio queue behind a setting. Then tag v1.0 and publish through JitPack.
+7. **Recommendations:** context, co-play, fatigue, eras, rediscovery, explore, reasons and the taste screen; rerank the radio queue behind a setting. Then tag v1.0 and publish through JitPack. *(First part for Minim 6.1: the radio rerank, On repeat, Forgotten favourites, Because you like X, skip signals, the recent-play filter and the cold-start check, from aggregates kept in memory. Context, co-play, fatigue, eras and explore are still to come.)*
 
 ## Open questions
 

@@ -70,6 +70,20 @@ class SqliteEventStore private constructor(
             events
         }
 
+    /** Only rows of those types are decoded (the type column is read first). */
+    override fun ofTypes(types: Set<String>): List<Event> {
+        if (types.isEmpty()) return emptyList()
+        val marks = types.joinToString(",") { "?" }
+        return db.rawQuery(
+            "SELECT json FROM $table WHERE type IN ($marks) ORDER BY ts, device, counter",
+            types.toTypedArray(),
+        ).use { c ->
+            val events = ArrayList<Event>(c.count)
+            while (c.moveToNext()) events.add(EventCodec.decode(c.getString(0)))
+            events
+        }
+    }
+
     override fun contains(id: EventId): Boolean =
         db.rawQuery("SELECT 1 FROM $table WHERE id = ? LIMIT 1", arrayOf(id.toString())).use { it.moveToFirst() }
 

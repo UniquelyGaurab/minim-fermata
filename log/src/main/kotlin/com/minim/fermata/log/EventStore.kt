@@ -20,6 +20,13 @@ interface EventStore {
     /** Every event, in canonical [Event.ORDER]. */
     fun all(): List<Event>
 
+    /**
+     * The events whose [Event.type] is in [types], in log order. For readers that need only a
+     * few kinds (the taste model reads plays, skips, likes and the like, not an app's own
+     * writes); a store with a type column can skip decoding everything else.
+     */
+    fun ofTypes(types: Set<String>): List<Event> = all().filter { it.type in types }
+
     fun contains(id: EventId): Boolean
 
     fun count(): Long

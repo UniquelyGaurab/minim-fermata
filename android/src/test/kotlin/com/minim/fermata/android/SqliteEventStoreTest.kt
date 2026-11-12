@@ -53,6 +53,42 @@ class SqliteEventStoreTest {
     }
 
     @Test
+    fun ofTypesReadsOnlyThoseTypesInLogOrder() {
+        val events = listOf(
+            event("b", 1, 1_000),
+            Event(EventId("a", 1), EventContext.at(900), EventBody.PlaylistCreate("p", "Mix")),
+            event("a", 2, 500),
+            Event(EventId("a", 3), EventContext.at(2_000), EventBody.Skip(TrackRef("s"), 1_000)),
+        )
+        store.appendAll(events)
+        val types = setOf(EventBody.PLAY, EventBody.SKIP)
+        assertEquals(InMemoryEventStore(events).ofTypes(types), store.ofTypes(types))
+        assertEquals(listOf(500L, 1_000L, 2_000L), store.ofTypes(types).map { it.timestamp })
+        assertEquals(emptyList(), store.ofTypes(emptySet()))
+    }
+
+    /** Builds the recommendations model from 50,000 stored events and prints the time (Robolectric's SQLite on the JVM). */
+    @Test
+    fun recommendationsWarmUpFromALargeStore() {
+        val tracks = (0 until 4_000).map { TrackRef("vid$it", "Song $it", "Artist ${it % 400}", 200_000) }
+        val rnd = java.util.Random(7)
+        val start = 1_760_000_000_000L
+        val events = (0 until 50_000).map { i ->
+            val t = tracks[(tracks.size * Math.pow(rnd.nextDouble(), 3.0)).toInt()]
+            val body = if (i % 5 == 0) EventBody.Skip(t, 8_000) else EventBody.Play(t, 150_000)
+            Event(EventId("phone", i + 1L), EventContext.at(start + i * 600_000L), body)
+        }
+        store.appendAll(events)
+        val clock = java.time.Clock.fixed(java.time.Instant.ofEpochMilli(start + 50_000 * 600_000L), java.time.ZoneOffset.UTC)
+        val fermata = Fermata(store, "phone", clock)
+        assertTrue(fermata.recs.warmUp())
+        val stats = fermata.recs.lastBuild!!
+        println("RECS_SQLITE_WARMUP events=${stats.events} readMs=${"%.1f".format(stats.readMs)} buildMs=${"%.1f".format(stats.buildMs)}")
+        assertEquals(50_000, stats.events)
+        assertEquals(com.minim.fermata.FermataRecs.State.READY, fermata.recs.state())
+    }
+
+    @Test
     fun drivesFermata() {
         val fermata = Fermata(store, "phone")
         fermata.record(EventBody.Like(Subject.Track(TrackRef("A"))))
