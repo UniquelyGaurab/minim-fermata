@@ -146,6 +146,23 @@ class FolderBackups(
      * it) is looked up again once.
      */
     fun mergeFromFolder(folder: BackupFolder?): MergeResult = synchronized(LOCK) {
+        val result = mergeAll(folder)
+        // Saved for the status line, so a merge that left something out is never silent.
+        val s = state.load()
+        state.save(
+            s.copy(
+                status = s.status.copy(
+                    lastMergeAt = if (result.error == null) result.at else s.status.lastMergeAt,
+                    lastMergeError = result.error?.takeIf { it != BackupError.NO_FOLDER },
+                    lastMergeProblemCount = result.problems.size,
+                    lastMergeProblem = result.problems.firstOrNull()?.let { "${it.fileName}: ${it.message}" },
+                )
+            )
+        )
+        result
+    }
+
+    private fun mergeAll(folder: BackupFolder?): MergeResult {
         val now = clock.millis()
         if (folder == null) return MergeResult(now, 0, 0, 0, 0, error = BackupError.NO_FOLDER)
         val entries = try {
@@ -180,14 +197,12 @@ class FolderBackups(
                 break
             }
         }
-        val s = state.load()
-        state.save(s.copy(status = s.status.copy(lastMergeAt = now)))
-        MergeResult(now, byPhone.size, merged, unchanged, added, problems)
+        return MergeResult(now, byPhone.size, merged, unchanged, added, problems)
     }
 
     /** The daily job: merge the other phones' backups in, then back up (so this backup carries them on). */
-    fun mergeAndBackUp(folder: BackupFolder?): Pair<MergeResult, BackupResult> = synchronized(LOCK) {
-        mergeFromFolder(folder) to backUp(folder)
+    fun mergeAndBackUp(folder: BackupFolder?, replacePrevious: Boolean = false): Pair<MergeResult, BackupResult> = synchronized(LOCK) {
+        mergeFromFolder(folder) to backUp(folder, replacePrevious)
     }
 
     /**

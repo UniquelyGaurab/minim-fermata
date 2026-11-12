@@ -585,6 +585,49 @@ class FolderBackupsTest {
     // --- helpers ---
 
     /** Where the event log's data starts inside a backup zip (after its local file header). */
+    @Test
+    fun `a merge the app fails to apply is saved in the status and retried next time`() {
+        val other = fermata("phoneB")
+        other.someHistory(a)
+        other.record(EventBody.Like(Subject.Track(b)))
+        FolderBackups(other, InMemoryBackupStateStore(), clock = clock).backUp(folder())
+        clock.now += MINUTE
+        val mine = fermata("phoneA")
+        mine.someHistory(c)
+        val backups = FolderBackups(mine, InMemoryBackupStateStore(), clock = clock)
+        var fail = true
+        mine.setApplier { if (fail) throw IllegalStateException("database is locked") }
+
+        val r = backups.mergeFromFolder(folder())
+        assertEquals(1, r.problems.size)
+        assertEquals(0, r.eventsAdded)
+        assertFalse(mine.library().isLiked("B"))
+        val st = backups.status()
+        assertTrue(st.mergeTroubled)
+        assertEquals(1, st.lastMergeProblemCount)
+        assertEquals("minim-phoneB-latest.minim: database is locked", st.lastMergeProblem)
+
+        fail = false
+        val again = backups.mergeFromFolder(folder())
+        assertEquals(1, again.filesMerged, "not remembered as merged: read again")
+        assertTrue(mine.library().isLiked("B"))
+        assertFalse(backups.status().mergeTroubled)
+        assertNull(backups.status().lastMergeProblem)
+    }
+
+    @Test
+    fun `a folder the merge cannot read is saved in the status`() {
+        val mine = fermata("phoneA")
+        val backups = FolderBackups(mine, InMemoryBackupStateStore(), clock = clock)
+        val goneDir = File(dir, "missing").apply { mkdirs() }
+        val gone = FileBackupFolder(goneDir)
+        goneDir.delete() // the folder went away after it was picked
+        val r = backups.mergeFromFolder(gone)
+        assertTrue(r.error != null)
+        assertEquals(r.error, backups.status().lastMergeError)
+        assertTrue(backups.status().mergeTroubled)
+    }
+
     private fun eventsDataStart(bytes: ByteArray): Int {
         val name = "fermata-events.jsonl.gz".toByteArray()
         val at = (0..bytes.size - name.size).first { i -> name.indices.all { bytes[i + it] == name[it] } }

@@ -20,6 +20,9 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
             lastError = prefs.getString(K_ERROR, null)?.let { runCatching { BackupError.valueOf(it) }.getOrNull() },
             lastErrorMessage = prefs.getString(K_ERROR_MESSAGE, null),
             lastMergeAt = long(K_MERGE),
+            lastMergeError = prefs.getString(K_MERGE_ERROR, null)?.let { runCatching { BackupError.valueOf(it) }.getOrNull() },
+            lastMergeProblemCount = prefs.getInt(K_MERGE_PROBLEMS, 0),
+            lastMergeProblem = prefs.getString(K_MERGE_PROBLEM, null),
         )
         val merged = prefs.all.entries
             .filter { it.key.startsWith(K_MERGED_PREFIX) && it.value is String }
@@ -38,6 +41,10 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
         if (error == null) e.remove(K_ERROR) else e.putString(K_ERROR, error.name)
         if (s.lastErrorMessage == null) e.remove(K_ERROR_MESSAGE) else e.putString(K_ERROR_MESSAGE, s.lastErrorMessage)
         putLong(e, K_MERGE, s.lastMergeAt)
+        val mergeError = s.lastMergeError
+        if (mergeError == null) e.remove(K_MERGE_ERROR) else e.putString(K_MERGE_ERROR, mergeError.name)
+        e.putInt(K_MERGE_PROBLEMS, s.lastMergeProblemCount)
+        if (s.lastMergeProblem == null) e.remove(K_MERGE_PROBLEM) else e.putString(K_MERGE_PROBLEM, s.lastMergeProblem)
         for (key in prefs.all.keys) if (key.startsWith(K_MERGED_PREFIX)) e.remove(key)
         for ((device, sha) in state.merged) e.putString(K_MERGED_PREFIX + device, sha)
         e.putBoolean(K_DISMISSED, state.restoreOfferDismissed)
@@ -59,6 +66,9 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
         const val K_ERROR = "last_error"
         const val K_ERROR_MESSAGE = "last_error_message"
         const val K_MERGE = "last_merge_at"
+        const val K_MERGE_ERROR = "last_merge_error"
+        const val K_MERGE_PROBLEMS = "last_merge_problem_count"
+        const val K_MERGE_PROBLEM = "last_merge_problem"
         const val K_DISMISSED = "restore_offer_dismissed"
         const val K_MERGED_PREFIX = "merged."
     }

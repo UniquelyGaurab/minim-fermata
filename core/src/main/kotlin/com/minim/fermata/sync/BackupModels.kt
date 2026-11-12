@@ -61,7 +61,16 @@ data class BackupStatus(
     val lastError: BackupError? = null,
     val lastErrorMessage: String? = null,
     val lastMergeAt: Long? = null,
+    /** The last merge could not read the folder at all ([BackupError.FOLDER_ACCESS_LOST], ...). */
+    val lastMergeError: BackupError? = null,
+    /** Other phones' backup files the last merge could not merge (damaged, or the app failed to apply them). */
+    val lastMergeProblemCount: Int = 0,
+    /** The first of those, as "file name: reason", for the status line. */
+    val lastMergeProblem: String? = null,
 ) {
+    /** True when the last merge left something out: the status line says so. */
+    val mergeTroubled: Boolean get() = lastMergeError != null || lastMergeProblemCount > 0
+
     /** True when a backup has worked and the latest attempt did not fail. */
     val ok: Boolean get() = lastSuccessAt != null && lastError == null
 }
