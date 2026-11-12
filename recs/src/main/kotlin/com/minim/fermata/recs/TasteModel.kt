@@ -16,9 +16,10 @@ import kotlin.math.pow
  * belong to which artist. Context, co-play, fatigue and eras come later (see DESIGN.md).
  *
  * Everything is updated per event, so the model is built once from the log ([build]) and then
- * kept current by applying each new event; a request never scans the log. Events are expected
- * in log order (oldest first), which [build] guarantees and a phone's own new events follow;
- * [lastAppliedAt] lets a caller notice anything older and rebuild instead.
+ * kept current by applying each new event; a request never scans the log. [build] applies events
+ * in log order. Applying a phone's own new events a little out of time order gives the same
+ * result as long as each track's events come in order: scores, counts and "last heard" do not
+ * depend on order, skip streaks and likes depend on it per track only.
  *
  * Scores decay exponentially with [RecsConfig.halfLifeDays]. The model is a cache: it can always
  * be rebuilt from the log with [build]. Not thread-safe: callers serialise access.

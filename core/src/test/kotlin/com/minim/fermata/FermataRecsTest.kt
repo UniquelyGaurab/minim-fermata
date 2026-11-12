@@ -3,6 +3,7 @@ package com.minim.fermata
 import com.minim.fermata.log.DAY
 import com.minim.fermata.log.EventBody
 import com.minim.fermata.log.EventStore
+import com.minim.fermata.log.Source
 import com.minim.fermata.log.HOUR
 import com.minim.fermata.log.InMemoryEventStore
 import com.minim.fermata.log.MINUTE
@@ -200,5 +201,23 @@ class FermataRecsTest {
         repeat(2) { f.play(hot) }
         clock.now += 40 * DAY
         assertEquals(listOf("hot"), f.recs.forgottenFavourites()!!.map { it.track.id })
+    }
+
+    @Test
+    fun aPlayRecordedWithItsStartTimeAfterLaterEventsStillCounts() {
+        val f = fermata()
+        f.warm()
+        f.recs.warmUp()
+        val t = track("t")
+        val start = clock.now
+        clock.now += 3 * MINUTE
+        f.record(EventBody.Queued(track("q")))
+        // An app recording a play after the fact, with the time it started.
+        f.recordAt(EventBody.Play(t, 180_000), start, Source.UNKNOWN)
+        assertFalse(f.recs.needsWarmUp(), "applied as it came, no rebuild")
+        assertTrue(f.recs.heardRecently("t"))
+        val live = f.recs.rank(listOf(t, track("q")))
+        val rebuilt = fermata(InMemoryEventStore(f.events())).also { it.recs.warmUp() }.recs.rank(listOf(t, track("q")))
+        assertEquals(rebuilt, live)
     }
 }

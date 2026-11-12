@@ -118,23 +118,30 @@ class FermataRecs internal constructor(
         val ids = taste.mapTo(HashSet()) { it.id }
         for (e in read) if (ids.remove(e.id) && ids.isEmpty()) break
         val missing = taste.filter { it.id in ids }
-        if (missing.all { inOrder(built, it) }) {
+        if (missing.all { inOrder(it) }) {
             for (e in missing) built.apply(e)
             return built
         }
         return TasteModel.build(read + missing, config)
     }
 
-    private fun inOrder(m: TasteModel, e: Event): Boolean =
+    /**
+     * Whether a newly recorded event can be applied to the live model as it is. An app may record
+     * a play with its start time after events that came later (Minim records a play when the
+     * next track starts); the model handles that, because what depends on order (skip streaks,
+     * like and unlike) depends on it per track, and a phone records one track's events in order.
+     * Corrections that replace an older event, legacy rows and clears need a rebuild.
+     */
+    private fun inOrder(e: Event): Boolean =
         e.ctx.replaces == null && e.id.device != EventId.LEGACY_DEVICE &&
-            e.type != com.minim.fermata.log.EventBody.HISTORY_CLEAR && e.timestamp >= m.lastAppliedAt
+            e.type != com.minim.fermata.log.EventBody.HISTORY_CLEAR
 
     /** Fermata calls this for every event this phone records, under its write lock. */
     internal fun recorded(e: Event) = synchronized(lock) {
         pending?.add(e)
         val m = model ?: return@synchronized
         if (e.type !in TasteModel.TYPES) return@synchronized
-        if (inOrder(m, e)) m.apply(e) else stale = true
+        if (inOrder(e)) m.apply(e) else stale = true
     }
 
     /** A merge or import ([drop] false: keep serving, rebuild later) or a clear/restore/rollback ([drop] true). */
