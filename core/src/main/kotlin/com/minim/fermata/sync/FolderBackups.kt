@@ -7,11 +7,15 @@ import com.minim.fermata.backup.BackupException
 import com.minim.fermata.backup.BackupNames
 import com.minim.fermata.backup.BackupRole
 import com.minim.fermata.backup.BackupTooNewException
+import com.minim.fermata.backup.ChainPoint
+import com.minim.fermata.backup.LogFile
+import com.minim.fermata.backup.LogFileData
+import com.minim.fermata.backup.LogFileKind
+import com.minim.fermata.backup.LogHeader
 import com.minim.fermata.backup.Manifest
+import com.minim.fermata.log.Event
 import java.io.FileNotFoundException
-import java.io.FilterOutputStream
 import java.io.IOException
-import java.io.OutputStream
 import java.security.SecureRandom
 import java.time.Clock
 
@@ -19,33 +23,42 @@ import java.time.Clock
  * Backups, restore and multi-phone merge over a [BackupFolder]. Pure Kotlin: the android module
  * runs it on a Storage Access Framework folder, tests run it on a plain directory.
  *
- * **Backup** ([backUp]): the whole log goes to `minim-<device>-<nonce>.tmp`, which is then read
- * back and checked (format, checksums, event count, version vector, device id). Only a good file
- * is moved into place as `latest`. `latest` is replaced on every backup, but `previous` moves on
- * at most once a day ([PREVIOUS_EVERY_MS]): then the old `latest` becomes `previous` (the old
- * `previous` is deleted); otherwise the old `latest` is parked under a temp name while the new
- * file moves in, and deleted after. So backing up every time the app closes never turns
- * `previous` into a copy from five minutes ago. If any step fails the folder still has a good
- * `latest` (the old one, put back if it had been moved), and the temp file is removed. Temp files
- * a killed run left behind are cleaned up on the next run (a parked `latest` is put back first if
- * the run died before the new one moved in); only this phone's own files are ever written or
- * deleted. [backUpIfChanged] skips the whole write when `latest` already holds the log.
+ * **Backup** ([backUp]), format 2 (Minim 6.2, see DESIGN.md "Backup files, format 2"). Each phone
+ * keeps one *chain* of files it writes once and never changes:
+ * - `minim-<device>-g<gen>-base.fermata`: the whole log when generation `gen` started;
+ * - `minim-<device>-g<gen>-p<seq>.fermata`: the events of real devices logged after piece
+ *   `seq - 1` (or the base). A backup after one new play writes one small piece.
  *
- * **Restore** ([restore]): the chosen file is read and fully checked before anything is touched,
- * then loaded with [Fermata.restore] (all or nothing, projections rebuilt from the log).
+ * Every file starts with a readable JSON header holding the chain's version vector after it, so
+ * "is this new?" never needs more than a header. A file is written as `minim-<device>-<nonce>.tmp`,
+ * read back and checked in full, and only then renamed to its final name: the rename is the commit.
+ * Now and then ([combineDue]), after a clear history, or when the log no longer continues the chain
+ * (merged-in imported plays, say), the next backup writes a new base, generation `gen + 1`; the old
+ * generation's files are deleted only after the new base is in place, so a kill at any step leaves
+ * a whole chain behind. Temp files a killed run left are deleted on the next run.
  *
- * **Merge** ([mergeFromFolder]): for every other phone, its `latest` (or `previous`, when
- * `latest` is damaged or half-synced) is checked and merged. Merging is by event id, so repeating
- * it adds nothing; the legacy and 5.9.0 rules travel inside the events (`replaces`), so a play
- * counts once whichever phones imported which copy. A backup whose event log has the same
- * checksum as the one merged last time is not read again, and neither is one whose manifest shows
- * nothing new: its version vector is covered by this phone's, and its legacy events (which have
- * no counters) are the set merged from that phone last time. Only a backup with something new,
- * an older manifest without the legacy fields, or a manifest that can't be read is read in full,
- * so a merge when the app opens stays cheap.
+ * The restore point ("previous") is a point in the chain, kept in every header. It moves on at
+ * most once a day ([PREVIOUS_EVERY_MS]) to the state before that backup, so backing up every time
+ * the app closes never turns it into a copy from five minutes ago; the files it needs are kept.
+ * After a clear history it is set to the new base, so no file keeps the cleared history.
+ * [backUpIfChanged] skips the whole write when the chain already holds the log. Format-1 files
+ * (`-latest.minim`, `-previous.minim`) this phone wrote before 6.2 are kept until the chain has a
+ * restore point of its own, then deleted; nothing writes format 1 any more.
  *
- * All operations of all instances run one at a time, so the daily job and "Back up now" never
- * overlap in one app. Calls block: run them off the main thread.
+ * **Restore** ([restore]): every file of the chosen chain up to the chosen point is read and fully
+ * checked (checksums, counts, and that each piece starts where the one before ended) before
+ * anything is touched, then loaded with [Fermata.restore] (all or nothing). Format-1 files restore
+ * as before.
+ *
+ * **Merge** ([mergeFromFolder]): for every other phone, the newest generation whose base reads.
+ * What was merged is remembered per phone as a chain point, so a merge on open reads only the new
+ * pieces, and skips the body of any file whose header's version vector this phone already has. A
+ * half-synced piece stops that phone's merge there; the next merge carries on. Phones still on
+ * 6.1.1 or older are merged from their format-1 files as before. Merging is by event id, so
+ * repeating it adds nothing.
+ *
+ * Only this phone's own files are ever written or deleted, so Syncthing and similar tools never
+ * see two phones write one file. All of this runs one at a time ([LOCK]).
  */
 class FolderBackups(
     private val fermata: Fermata,
@@ -56,12 +69,9 @@ class FolderBackups(
     private val deviceId: String get() = fermata.deviceId
 
     /**
-     * Backs up the whole log into [folder] and records the result in [status].
-     *
-     * With [replacePrevious] (used right after "clear listening history") the old latest is not
-     * kept as `previous`: `previous` becomes a second copy of the new backup, so none of this
-     * phone's files still holds the cleared history. If the copy fails, the old file is still
-     * deleted and only `latest` is left.
+     * Backs up what is new. [replacePrevious] is for after "clear history": the next file is a new
+     * base, which becomes the restore point too, and every older file of this phone is deleted, so
+     * no backup keeps the cleared history.
      */
     fun backUp(folder: BackupFolder?, replacePrevious: Boolean = false): BackupResult = synchronized(LOCK) {
         val now = clock.millis()
@@ -81,12 +91,8 @@ class FolderBackups(
     }
 
     /**
-     * Backs up only when the log holds something this phone's `latest` in [folder] does not.
-     * Reads just that file's manifest and compares its version vector and event count with the
-     * log's: when they match, nothing is written and the result is a [BackupResult.Success] with
-     * `written = false` (recorded in [status] as a backup that worked, since `latest` is
-     * current). A missing, unreadable, older-format or other-phone `latest` means a full backup.
-     * For backups the app starts itself (when it goes to the background, the daily job).
+     * Like [backUp], but writes nothing when this phone's chain already holds the log (same
+     * version vector, event count and clear point). For the backup when the app closes.
      */
     fun backUpIfChanged(folder: BackupFolder?): BackupResult = synchronized(LOCK) {
         if (folder != null) {
@@ -106,75 +112,133 @@ class FolderBackups(
         backUp(folder)
     }
 
-    /** A not-written result when this phone's `latest` in [folder] already holds the whole log, else null. */
     private fun upToDate(folder: BackupFolder, now: Long): BackupResult.Success? {
-        val latestName = BackupNames.latest(deviceId)
-        val latest = try {
-            folder.list().firstOrNull { it.name == latestName }
-        } catch (e: SecurityException) {
-            throw e
-        } catch (e: Exception) {
-            null
-        } ?: return null
-        val m = try {
-            folder.openInput(latest).use { BackupArchive.readManifest(it) }
+        val entries = try {
+            folder.list()
         } catch (e: SecurityException) {
             throw e
         } catch (e: Exception) {
             return null
         }
-        if (m.format != BackupArchive.FORMAT || m.deviceId != deviceId) return null
-        // Both read under Fermata's lock, so no event can land between them.
-        val (heads, count) = fermata.transaction { fermata.loggedHeads() to fermata.eventCount() }
-        if (m.heads != heads || m.eventCount != count) return null
-        val bytes = if (latest.size >= 0) latest.size else state.load().status.lastBytes
-        return BackupResult.Success(now, latest.name, count, bytes, written = false)
+        val own = ownTip(folder, entries) ?: return null
+        val snap = fermata.transaction { Snapshot(fermata.loggedHeads(), fermata.eventCount(), fermata.clearedBefore()) }
+        val h = own.header
+        if (h.heads != snap.heads || h.chainCount != snap.count || h.clearedBefore != snap.clearedBefore) return null
+        return BackupResult.Success(now, own.entry.name, h.chainCount, size(own.entry), written = false, totalBytes = own.totalBytes)
     }
 
-    /** The last backup result, as Settings → Storage shows it. */
     fun status(): BackupStatus = state.load().status
 
     /**
-     * Every backup in [folder], from any phone, newest first. Reads only the manifests; a file that
-     * cannot be restored is still listed, with [BackupInfo.problem] saying why.
+     * The backups in [folder], newest first: for each phone on 6.2 or newer its latest point and
+     * its restore point; for older phones their format-1 files. Reads headers only.
      */
     fun list(folder: BackupFolder): List<BackupInfo> = synchronized(LOCK) {
-        folder.list().mapNotNull { entry ->
-            val name = BackupNames.parse(entry.name) ?: return@mapNotNull null
-            try {
-                val m = folder.openInput(entry).use { BackupArchive.readManifest(it) }
-                val tooNew = m.format > BackupArchive.FORMAT
-                BackupInfo(
-                    entry = entry,
-                    role = name.role,
-                    deviceId = m.deviceId,
-                    createdAt = m.createdAt,
-                    eventCount = m.eventCount,
-                    fermataVersion = m.fermataVersion,
-                    appVersion = m.appVersion,
-                    fromThisPhone = m.deviceId == deviceId,
-                    problem = if (tooNew) "Made by a newer version of Minim (backup format ${m.format})" else null,
-                )
-            } catch (e: SecurityException) {
-                throw e
-            } catch (e: Exception) {
-                BackupInfo(
-                    entry, name.role, name.deviceId, null, null, null, null,
-                    fromThisPhone = name.deviceId == deviceId,
-                    problem = "Can't be read: ${describe(e)}",
-                )
+        val entries = folder.list()
+        val out = ArrayList<BackupInfo>()
+        val chained = HashSet<String>()
+        for ((device, gens) in chainsIn(entries)) {
+            val infos = chainInfos(folder, device, gens)
+            // Until the chain has a restore point of its own, the pre-6.2 files stay listed.
+            if (infos.any { it.problem == null && it.role == BackupRole.PREVIOUS }) chained += device
+            out += infos
+        }
+        for (entry in entries) {
+            val name = BackupNames.parse(entry.name) ?: continue
+            if (name.deviceId != null && name.deviceId in chained) continue // the chain supersedes them
+            out += format1Info(folder, entry, name.role, name.deviceId)
+        }
+        out.sortedWith(compareByDescending<BackupInfo> { it.createdAt ?: Long.MIN_VALUE }.thenBy { it.fileName })
+    }
+
+    private fun chainInfos(folder: BackupFolder, device: String, gens: Map<Long, Map<Long, FolderEntry>>): List<BackupInfo> {
+        val out = ArrayList<BackupInfo>()
+        for (gen in gens.keys.sortedDescending()) {
+            val files = contiguous(gens.getValue(gen))
+            for (i in files.indices.reversed()) {
+                val entry = files[i]
+                val h = try {
+                    readHeader(folder, entry, device, gen, i.toLong())
+                } catch (e: SecurityException) {
+                    throw e
+                } catch (e: BackupTooNewException) {
+                    out += problemInfo(entry, BackupRole.LATEST, device, "Made by a newer version of Minim (${e.message})")
+                    return out
+                } catch (e: Exception) {
+                    out += problemInfo(entry, BackupRole.LATEST, device, "Can't be read: ${describe(e)}")
+                    continue
+                }
+                out += chainInfo(entry, BackupRole.LATEST, h)
+                val rp = h.restorePoint
+                if (rp != null && !(rp.gen == gen && rp.seq == h.seq)) {
+                    val rpEntry = gens[rp.gen]?.let { contiguous(it) }?.getOrNull(rp.seq.toInt())
+                    if (rpEntry != null) {
+                        out += try {
+                            chainInfo(rpEntry, BackupRole.PREVIOUS, readHeader(folder, rpEntry, device, rp.gen, rp.seq))
+                        } catch (e: SecurityException) {
+                            throw e
+                        } catch (e: Exception) {
+                            problemInfo(rpEntry, BackupRole.PREVIOUS, device, "Can't be read: ${describe(e)}")
+                        }
+                    }
+                }
+                return out
             }
-        }.sortedWith(compareByDescending<BackupInfo> { it.createdAt ?: Long.MIN_VALUE }.thenBy { it.fileName })
+        }
+        return out
+    }
+
+    private fun chainInfo(entry: FolderEntry, role: BackupRole, h: LogHeader) = BackupInfo(
+        entry = entry,
+        role = role,
+        deviceId = h.deviceId,
+        createdAt = h.createdAt,
+        eventCount = h.chainCount,
+        fermataVersion = h.fermataVersion,
+        appVersion = h.appVersion,
+        fromThisPhone = h.deviceId == deviceId,
+    )
+
+    private fun problemInfo(entry: FolderEntry, role: BackupRole, device: String?, problem: String) =
+        BackupInfo(entry, role, device, null, null, null, null, fromThisPhone = device == deviceId, problem = problem)
+
+    private fun format1Info(folder: BackupFolder, entry: FolderEntry, role: BackupRole, device: String?): BackupInfo = try {
+        val m = folder.openInput(entry).use { BackupArchive.readManifest(it) }
+        val tooNew = m.format > BackupArchive.FORMAT
+        BackupInfo(
+            entry = entry,
+            role = role,
+            deviceId = m.deviceId,
+            createdAt = m.createdAt,
+            eventCount = m.eventCount,
+            fermataVersion = m.fermataVersion,
+            appVersion = m.appVersion,
+            fromThisPhone = m.deviceId == deviceId,
+            problem = if (tooNew) "Made by a newer version of Minim (backup format ${m.format})" else null,
+        )
+    } catch (e: SecurityException) {
+        throw e
+    } catch (e: Exception) {
+        problemInfo(entry, role, device, "Can't be read: ${describe(e)}")
     }
 
     /**
-     * Restores [backup]. The file is read and checked in full first; if it is damaged, gone, too
-     * new, or cannot be applied, nothing changes. Restoring is a merge, so restoring into a library
-     * that already has history is safe and counts nothing twice.
+     * Restores [backup]: for a format-2 file, the chain up to and including it; for a format-1
+     * file, that file. Everything is read and checked before the log is touched.
      */
     fun restore(folder: BackupFolder, backup: BackupInfo): RestoreResult = synchronized(LOCK) {
-        val read = try {
-            folder.openInput(backup.entry).use { BackupArchive.read(it) }
+        val chain = BackupNames.parseChain(backup.fileName)
+        val header: LogHeader?
+        val read: Backup
+        try {
+            if (chain != null) {
+                val (h, events) = readChain(folder, chain.deviceId, chain.gen, chain.seq)
+                header = h
+                read = Backup(manifestOf(h), events)
+            } else {
+                header = null
+                read = folder.openInput(backup.entry).use { BackupArchive.read(it) }
+            }
         } catch (e: FileNotFoundException) {
             return RestoreResult.Failure(BackupError.NOT_FOUND, "${backup.fileName} is no longer in the folder")
         } catch (e: SecurityException) {
@@ -189,25 +253,54 @@ class FolderBackups(
         try {
             val stats = fermata.restore(read.events)
             if (read.manifest.deviceId != deviceId) {
-                remember(read.manifest.deviceId, BackupArchive.eventsChecksum(read.manifest), BackupArchive.legacyDigest(read.events))
+                if (header != null) rememberChain(header.deviceId, header.gen, header.seq, header.legacyDigest)
+                else remember(read.manifest.deviceId, BackupArchive.eventsChecksum(read.manifest), BackupArchive.legacyDigest(read.events))
             }
-            RestoreResult.Success(
-                stats.added, stats.total, read.manifest.deviceId, read.manifest.createdAt, read.manifest.fermataVersion,
-            )
+            RestoreResult.Success(stats.added, stats.total, read.manifest.deviceId, read.manifest.createdAt, read.manifest.fermataVersion)
         } catch (e: Exception) {
             RestoreResult.Failure(BackupError.RESTORE_FAILED, describe(e))
         }
     }
 
+    private fun manifestOf(h: LogHeader) = Manifest(
+        format = h.format, createdAt = h.createdAt, deviceId = h.deviceId, fermataVersion = h.fermataVersion,
+        appVersion = h.appVersion, eventCount = h.chainCount, heads = h.heads, files = emptyList(),
+        legacyCount = h.legacyCount, legacyDigest = h.legacyDigest,
+    )
+
     /**
-     * Reads the other phones' newest backups from [folder] and merges the events this phone has
-     * not seen. Damaged or half-synced files are skipped (falling back to that phone's `previous`)
-     * and retried next time; a file that disappears while being read (its phone was just rotating
-     * it) is looked up again once.
+     * Reads and checks the base and pieces 1..[seq] of [device]'s generation [gen]. Throws
+     * [FileNotFoundException] when a file is missing, [BackupException] when one is damaged or
+     * the pieces don't follow on from each other.
+     */
+    private fun readChain(folder: BackupFolder, device: String, gen: Long, seq: Long): Pair<LogHeader, List<Event>> {
+        val files = chainsIn(folder.list())[device]?.get(gen) ?: throw FileNotFoundException(BackupNames.chainBase(device, gen))
+        val events = ArrayList<Event>()
+        var prev: LogHeader? = null
+        for (s in 0..seq) {
+            val entry = files[s] ?: throw FileNotFoundException(BackupNames.chainFile(device, gen, s))
+            val h = readFile(folder, entry, device, gen, s).let { d ->
+                events += d.events
+                d.header
+            }
+            if (prev != null) {
+                if (h.from != prev.heads) throw BackupException("${entry.name} doesn't follow on from the piece before it")
+                if (h.chainCount != prev.chainCount + h.events) throw BackupException("${entry.name}: the event count doesn't add up")
+                if (h.clearedBefore != prev.clearedBefore || h.legacyDigest != prev.legacyDigest) {
+                    throw BackupException("${entry.name} belongs to another chain")
+                }
+            }
+            prev = h
+        }
+        return prev!! to events
+    }
+
+    /**
+     * Merges the backups of every other phone in [folder] into this phone's log; see the class
+     * comment. Reads nothing but headers when nothing is new.
      */
     fun mergeFromFolder(folder: BackupFolder?): MergeResult = synchronized(LOCK) {
         val result = mergeAll(folder)
-        // Saved for the status line, so a merge that left something out is never silent.
         val s = state.load()
         state.save(
             s.copy(
@@ -232,37 +325,134 @@ class FolderBackups(
         } catch (e: Exception) {
             return MergeResult(now, 0, 0, 0, 0, listOf(MergeProblem("(folder)", describe(e))), BackupError.FOLDER_UNREADABLE)
         }
-        val byPhone = phonesIn(entries)
+        val chains = chainsIn(entries).filterKeys { it != deviceId }
+        val format1 = phonesIn(entries)
+        val phones = (chains.keys + format1.keys).toSortedSet()
         var merged = 0
         var unchanged = 0
         var added = 0
         val problems = ArrayList<MergeProblem>()
-        for ((phone, files) in byPhone) {
-            for (role in listOf(BackupRole.LATEST, BackupRole.PREVIOUS)) {
-                val outcome = try {
-                    mergeOne(folder, phone, files[role] ?: continue)
-                } catch (e: SecurityException) {
-                    return MergeResult(now, byPhone.size, merged, unchanged, added, problems, BackupError.FOLDER_ACCESS_LOST)
-                } catch (e: Exception) {
-                    problems += MergeProblem(files.getValue(role).name, describe(e))
+        for (phone in phones) {
+            try {
+                val gens = chains[phone]
+                val chainOutcome = if (gens != null) mergeChain(folder, phone, gens, problems) else null
+                if (chainOutcome != null) {
+                    if (chainOutcome == NOTHING_NEW) unchanged++ else {
+                        merged++
+                        added += chainOutcome
+                    }
                     continue
                 }
-                when (outcome) {
-                    null -> unchanged++
-                    else -> {
+                // A phone on 6.1.1 or older, or one whose chain can't be read at all yet.
+                val files = format1[phone] ?: continue
+                for (role in listOf(BackupRole.LATEST, BackupRole.PREVIOUS)) {
+                    val entry = files[role] ?: continue
+                    val outcome = try {
+                        mergeOne(folder, phone, entry)
+                    } catch (e: SecurityException) {
+                        throw e
+                    } catch (e: Exception) {
+                        problems += MergeProblem(entry.name, describe(e))
+                        continue
+                    }
+                    if (outcome == null) unchanged++ else {
                         merged++
                         added += outcome
                     }
+                    break
                 }
-                break
+            } catch (e: SecurityException) {
+                return MergeResult(now, phones.size, merged, unchanged, added, problems, BackupError.FOLDER_ACCESS_LOST)
             }
         }
-        return MergeResult(now, byPhone.size, merged, unchanged, added, problems)
+        return MergeResult(now, phones.size, merged, unchanged, added, problems)
     }
 
     /**
-     * The daily job: merge the other phones' backups in, then back up (so this backup carries them
-     * on). With [onlyIfChanged] the backup is [backUpIfChanged]; [replacePrevious] always writes.
+     * Merges [phone]'s chain: its newest generation whose base reads (an older one while a new
+     * base is still syncing). Returns how many events were added, [NOTHING_NEW] when no file
+     * body had to be read, or null when no generation could be read at all.
+     */
+    private fun mergeChain(
+        folder: BackupFolder,
+        phone: String,
+        gens: Map<Long, Map<Long, FolderEntry>>,
+        problems: MutableList<MergeProblem>,
+    ): Int? {
+        for (gen in gens.keys.sortedDescending()) {
+            val files = contiguous(gens.getValue(gen))
+            if (files.isEmpty()) continue
+            val cursor = chainCursor(phone)
+            var start = if (cursor != null && cursor.gen == gen) cursor.seq + 1 else 0L
+            var added = 0
+            var readAny = false
+            if (start == 0L) {
+                try {
+                    val h = readHeader(folder, files[0], phone, gen, 0)
+                    if (!nothingNewIn(h, phone)) {
+                        added += fermata.merge(readFile(folder, files[0], phone, gen, 0).events)
+                        readAny = true
+                    }
+                    rememberChain(phone, gen, 0, h.legacyDigest)
+                } catch (e: SecurityException) {
+                    throw e
+                } catch (e: FileNotFoundException) {
+                    continue // deleted while we looked: the phone combined again
+                } catch (e: Exception) {
+                    problems += MergeProblem(files[0].name, describe(e))
+                    continue
+                }
+                start = 1
+            }
+            for (s in start until files.size) {
+                val entry = files[s.toInt()]
+                try {
+                    val h = readHeader(folder, entry, phone, gen, s)
+                    if (!covered(h.heads, fermata.loggedHeads())) {
+                        added += fermata.merge(readFile(folder, entry, phone, gen, s).events)
+                        readAny = true
+                    }
+                    rememberChain(phone, gen, s, null)
+                } catch (e: SecurityException) {
+                    throw e
+                } catch (e: FileNotFoundException) {
+                    break // the phone combined its pieces meanwhile; the next merge reads the new base
+                } catch (e: Exception) {
+                    // Half-synced or damaged: stop here, the next merge carries on from this piece.
+                    problems += MergeProblem(entry.name, describe(e))
+                    break
+                }
+            }
+            return if (readAny) added else NOTHING_NEW
+        }
+        return null
+    }
+
+    /** True when a file with header [h] holds nothing this phone lacks: its body needn't be read. */
+    private fun nothingNewIn(h: LogHeader, phone: String): Boolean {
+        val legacyKnown = h.legacyCount == 0L || h.legacyDigest == state.load().mergedLegacy[phone]
+        return legacyKnown && covered(h.heads, fermata.loggedHeads())
+    }
+
+    private fun chainCursor(phone: String): ChainPoint? {
+        val parts = (state.load().merged[CHAIN_KEY + phone] ?: return null).split(':')
+        if (parts.size != 2) return null
+        return ChainPoint(parts[0].toLongOrNull() ?: return null, parts[1].toLongOrNull() ?: return null)
+    }
+
+    private fun rememberChain(phone: String, gen: Long, seq: Long, legacyDigest: String?) {
+        val s = state.load()
+        state.save(
+            s.copy(
+                merged = s.merged + (CHAIN_KEY + phone to "$gen:$seq"),
+                mergedLegacy = if (legacyDigest != null) s.mergedLegacy + (phone to legacyDigest) else s.mergedLegacy,
+            )
+        )
+    }
+
+    /**
+     * Merges, then backs up, under one lock. [onlyIfChanged] uses [backUpIfChanged] (ignored
+     * with [replacePrevious], which always writes).
      */
     fun mergeAndBackUp(
         folder: BackupFolder?,
@@ -274,8 +464,8 @@ class FolderBackups(
     }
 
     /**
-     * Whether to offer "Restore from a backup": only on an empty library (a fresh install), and not
-     * after the user said no ([dismissRestoreOffer]).
+     * What to offer on a fresh install: nothing when the log has events or the offer was
+     * dismissed, otherwise the restorable backups in [folder] (or a prompt to pick one).
      */
     fun restoreOffer(folder: BackupFolder?): RestoreOffer = synchronized(LOCK) {
         if (state.load().restoreOfferDismissed || fermata.eventCount() > 0) return RestoreOffer.NotNeeded
@@ -292,141 +482,227 @@ class FolderBackups(
         state.save(state.load().copy(restoreOfferDismissed = true))
     }
 
-    // --- Backup steps ---
+    // ---------------------------------------------------------------------------------------
+    // Writing
 
-    private fun writeBackup(folder: BackupFolder, now: Long, replacePrevious: Boolean = false): BackupResult {
-        val latestName = BackupNames.latest(deviceId)
-        val previousName = BackupNames.previous(deviceId)
-        var entries = folder.list()
+    private data class Snapshot(
+        val heads: Map<String, Long>,
+        val count: Long,
+        val clearedBefore: Long?,
+        val newEvents: List<Event>? = null,
+    )
 
-        // Temp files of a killed run. Only this phone's: another phone may be writing its own now.
-        // A run killed after parking the old latest but before the new one moved in left no latest:
-        // the parked file goes back first.
-        val stale = entries.filter { BackupNames.isOwnTemp(it.name, deviceId) }
-        val parkedOld = if (entries.none { it.name == latestName }) {
-            stale.filter { it.name.endsWith(PARKED_SUFFIX) }.maxByOrNull { it.name }
-        } else {
-            null
-        }
-        val putBack = parkedOld?.takeIf { runCatching { folder.rename(it, latestName) }.isSuccess }
-        for (old in stale) if (old != putBack) runCatching { folder.delete(old) }
-        if (putBack != null) entries = folder.list()
+    private class OwnTip(val gen: Long, val entry: FolderEntry, val header: LogHeader, val files: List<FolderEntry>) {
+        val totalBytes: Long get() = files.sumOf { maxOf(it.size, 0L) }
+    }
 
-        // 1. Write the temp file.
-        val temp = folder.create(BackupNames.temp(deviceId, "$now-${nonce()}"))
-        val (manifest: Manifest, bytes: Long) = try {
-            folder.openOutput(temp).use { out ->
-                val c = CountingOutputStream(out)
-                val m = fermata.export(c, appVersion)
-                c.flush()
-                m to c.count
+    /**
+     * This phone's chain: the newest generation with a base, up to its last file that reads.
+     * Null when there is none, or when nothing of that generation reads (the next backup then
+     * starts a new generation).
+     */
+    private fun ownTip(folder: BackupFolder, entries: List<FolderEntry>): OwnTip? {
+        val gens = chainsIn(entries)[deviceId] ?: return null
+        val gen = gens.keys.sortedDescending().firstOrNull { gens.getValue(it).containsKey(0L) } ?: return null
+        val files = contiguous(gens.getValue(gen))
+        for (i in files.indices.reversed()) {
+            val h = try {
+                readHeader(folder, files[i], deviceId, gen, i.toLong())
+            } catch (e: SecurityException) {
+                throw e
+            } catch (e: Exception) {
+                continue
             }
+            return OwnTip(gen, files[i], h, files.subList(0, i + 1))
+        }
+        return null
+    }
+
+    private fun writeBackup(folder: BackupFolder, now: Long, replacePrevious: Boolean): BackupResult {
+        val entries = folder.list()
+        for (t in entries) if (BackupNames.isOwnTemp(t.name, deviceId)) runCatching { folder.delete(t) }
+        val own = ownTip(folder, entries)
+        val snap = fermata.transaction {
+            Snapshot(
+                fermata.loggedHeads(), fermata.eventCount(), fermata.clearedBefore(),
+                own?.let { fermata.deviceEventsAfter(it.header.heads) },
+            )
+        }
+        // After a clear (here, or merged in from another phone) start afresh, so no file keeps
+        // the cleared history.
+        val fresh = replacePrevious || (own != null && own.header.clearedBefore != snap.clearedBefore)
+        val newEvents = snap.newEvents.orEmpty()
+        val continues = own != null && !fresh && covered(own.header.heads, snap.heads) &&
+            own.header.chainCount + newEvents.size == snap.count
+        if (own != null && continues && newEvents.isEmpty()) {
+            // Nothing new since the last file ("Back up now" twice): nothing to write.
+            cleanUp(folder, own.gen, own.header.seq, own.header.restorePoint)
+            return BackupResult.Success(now, own.entry.name, own.header.chainCount, size(own.entry), written = false, totalBytes = own.totalBytes)
+        }
+        // A file of this generation past the tip (a damaged piece, or one after a gap) would clash
+        // with the next piece's name: start a new generation instead.
+        val strays = own != null && chainsIn(entries)[deviceId]?.get(own.gen)?.keys?.any { it > own.header.seq } == true
+        val piece = own != null && continues && !strays && !combineDue(own)
+        val rotate = own != null && !fresh && previousDue(now)
+        val restorePoint: ChainPoint? = if (own != null && rotate) {
+            ChainPoint(own.gen, own.header.seq, now) // the state before this backup
+        } else {
+            own?.header?.restorePoint
+        }
+        val header: LogHeader
+        val bytes: ByteArray
+        val name: String
+        if (own != null && piece) {
+            val seq = own.header.seq + 1
+            val built = LogFile.build(
+                LogFileKind.PIECE, deviceId, own.gen, seq, newEvents, now, appVersion,
+                prev = own.header, clearedBefore = snap.clearedBefore, restorePoint = restorePoint,
+            )
+            header = built.first
+            bytes = built.second
+            name = BackupNames.chainPiece(deviceId, own.gen, seq)
+        } else {
+            val gen = maxOf(chainsIn(entries)[deviceId]?.keys?.maxOrNull() ?: 0L, state.load().lastGen) + 1
+            val (events, cleared) = fermata.transaction { fermata.events() to fermata.clearedBefore() }
+            val built = LogFile.build(
+                LogFileKind.BASE, deviceId, gen, 0, events, now, appVersion,
+                prev = null, clearedBefore = cleared, restorePoint = if (fresh) ChainPoint(gen, 0, now) else restorePoint,
+            )
+            header = built.first
+            bytes = built.second
+            name = BackupNames.chainBase(deviceId, gen)
+        }
+        val written = writeFile(folder, name, header, bytes, now)
+        if (written !is BackupResult.Success) return written
+        if (rotate || fresh) state.save(state.load().copy(previousRotatedAt = now))
+        if (header.gen > state.load().lastGen) state.save(state.load().copy(lastGen = header.gen))
+        // Committed. Files nothing points to go only now; if this is killed, the next run does it.
+        cleanUp(folder, header.gen, header.seq, header.restorePoint)
+        val total = (if (own != null && piece) own.totalBytes else 0L) + bytes.size
+        return written.copy(totalBytes = total)
+    }
+
+    /**
+     * Writes [bytes] to a temp file, reads it back and checks it against [header], then renames
+     * it to [name]. On any failure the temp file is removed and the folder is as it was.
+     */
+    private fun writeFile(folder: BackupFolder, name: String, header: LogHeader, bytes: ByteArray, now: Long): BackupResult {
+        val temp = folder.create(BackupNames.temp(deviceId, "$now-${nonce()}"))
+        try {
+            folder.openOutput(temp).use { LogFile.write(it, bytes) }
         } catch (e: Exception) {
             runCatching { folder.delete(temp) }
             throw e
         }
-
-        // 2. Read it back and check it.
-        val problem = verify(folder, temp, manifest)
+        val problem = try {
+            val back = folder.openInput(temp).use { LogFile.read(it) }
+            when {
+                back.header != header -> "the header differs"
+                back.events.size.toLong() != header.events -> "${back.events.size} events, expected ${header.events}"
+                else -> null
+            }
+        } catch (e: SecurityException) {
+            throw e
+        } catch (e: Exception) {
+            describe(e)
+        }
         if (problem != null) {
             runCatching { folder.delete(temp) }
             return BackupResult.Failure(now, BackupError.VERIFY_FAILED, "The new backup didn't check out ($problem); the old one is kept")
         }
-
-        // 3. When previous is due (at most once a day): latest -> previous (the old previous goes).
-        //    Otherwise the old latest is parked under a temp name and deleted once the new one is in.
-        //    Then temp -> latest.
-        val oldLatest = entries.firstOrNull { it.name == latestName }
-        val oldPrevious = entries.firstOrNull { it.name == previousName }
-        val rotate = oldLatest != null && (replacePrevious || oldPrevious == null || previousDue(now))
-        var movedLatest: FolderEntry? = null
-        var parked: FolderEntry? = null
-        var newFile = temp
-        try {
-            if (oldLatest != null) {
-                if (rotate) {
-                    if (oldPrevious != null) folder.delete(oldPrevious)
-                    movedLatest = folder.rename(oldLatest, previousName)
-                } else {
-                    parked = folder.rename(oldLatest, BackupNames.temp(deviceId, "$now-${nonce()}$PARKED"))
-                }
-            }
-            newFile = folder.rename(temp, latestName)
-            check(newFile.name == latestName) { "the folder named the backup ${newFile.name}" }
-            if (rotate) state.save(state.load().copy(previousRotatedAt = now))
-            parked?.let { runCatching { folder.delete(it) } } // if this fails, the next run deletes it
-            if (replacePrevious) replacePreviousWith(folder, newFile, manifest, now, movedLatest ?: oldPrevious)
-            return BackupResult.Success(now, newFile.name, manifest.eventCount, bytes)
+        return try {
+            val moved = folder.rename(temp, name)
+            check(moved.name == name) { "the folder named the backup ${moved.name}" }
+            BackupResult.Success(now, name, header.chainCount, bytes.size.toLong())
         } catch (e: SecurityException) {
             throw e
         } catch (e: Exception) {
-            // Put the old latest back, so the folder is never left without one.
-            if (newFile.name != latestName) {
-                runCatching { folder.delete(newFile) }
-                movedLatest?.let { runCatching { folder.rename(it, latestName) } }
-                parked?.let { runCatching { folder.rename(it, latestName) } }
-            }
-            return BackupResult.Failure(now, BackupError.RENAME_FAILED, "Couldn't move the new backup into place (${describe(e)}); the old one is kept")
+            runCatching { folder.delete(temp) }
+            BackupResult.Failure(now, BackupError.RENAME_FAILED, "Couldn't move the new backup into place (${describe(e)}); the old one is kept")
         }
     }
 
     /**
-     * Whether `previous` may move on now: never moved on (or not recorded), a day or more since
-     * it last did, or the clock is now well before the last time (it was set back, or was ahead
-     * then). In that last case it moves on once and the day counts from the new time, so a wrong
-     * clock costs at most one extra move, never a `previous` that moves on every backup or never.
+     * Deletes this phone's files nothing points to any more: other generations, pieces past the
+     * tip, the restore point's generation past the restore point, and (once the chain has a
+     * restore point of its own) the format-1 files from before 6.2. Best effort; the next run
+     * finishes what fails.
      */
+    private fun cleanUp(folder: BackupFolder, gen: Long, seq: Long, restorePoint: ChainPoint?) {
+        val entries = try {
+            folder.list()
+        } catch (e: SecurityException) {
+            throw e
+        } catch (e: Exception) {
+            return
+        }
+        for (e in entries) {
+            val c = BackupNames.parseChain(e.name)
+            val drop = if (c != null) {
+                c.deviceId == deviceId &&
+                    !(c.gen == gen && c.seq <= seq) &&
+                    !(restorePoint != null && c.gen == restorePoint.gen && c.seq <= restorePoint.seq)
+            } else {
+                restorePoint != null && BackupNames.parse(e.name)?.deviceId == deviceId
+            }
+            if (drop) runCatching { folder.delete(e) }
+        }
+    }
+
+    /**
+     * True when the next backup should combine the chain into a new base: [MAX_PIECES] pieces, or
+     * pieces adding up to half the base and at least [COMBINE_MIN_BYTES] (a piece compresses less
+     * well than one base).
+     */
+    private fun combineDue(own: OwnTip): Boolean {
+        if (own.header.seq >= MAX_PIECES) return true
+        val pieceBytes = own.files.drop(1).sumOf { maxOf(it.size, 0L) }
+        val baseBytes = maxOf(own.files[0].size, 0L)
+        return pieceBytes >= COMBINE_MIN_BYTES && pieceBytes * 2 >= baseBytes
+    }
+
     private fun previousDue(now: Long): Boolean {
         val last = state.load().previousRotatedAt ?: return true
         return now - last >= PREVIOUS_EVERY_MS || now < last - CLOCK_SLACK_MS
     }
 
-    /**
-     * Deletes [old] (the file that would have stayed as `previous`) and writes a checked copy of
-     * [latest] as `previous`. Best effort: a failed copy leaves just `latest`, never the old file.
-     */
-    private fun replacePreviousWith(folder: BackupFolder, latest: FolderEntry, manifest: Manifest, now: Long, old: FolderEntry?) {
-        val previousName = BackupNames.previous(deviceId)
-        if (old != null) folder.delete(old)
-        folder.list().filter { it.name == previousName }.forEach { runCatching { folder.delete(it) } }
-        val temp = folder.create(BackupNames.temp(deviceId, "$now-${nonce()}"))
-        try {
-            folder.openInput(latest).use { input -> folder.openOutput(temp).use { out -> input.copyTo(out) } }
-            if (verify(folder, temp, manifest) != null) {
-                runCatching { folder.delete(temp) }
-                return
-            }
-            folder.rename(temp, previousName)
-        } catch (e: SecurityException) {
-            throw e
-        } catch (e: Exception) {
-            runCatching { folder.delete(temp) }
+    // ---------------------------------------------------------------------------------------
+    // Reading
+
+    /** device -> generation -> piece number -> file, for every format-2 file in [entries]. */
+    private fun chainsIn(entries: List<FolderEntry>): Map<String, Map<Long, Map<Long, FolderEntry>>> {
+        val out = sortedMapOf<String, MutableMap<Long, MutableMap<Long, FolderEntry>>>()
+        for (e in entries) {
+            val c = BackupNames.parseChain(e.name) ?: continue
+            out.getOrPut(c.deviceId) { sortedMapOf() }.getOrPut(c.gen) { sortedMapOf() }[c.seq] = e
         }
+        return out
     }
 
-    /** Reads [entry] back in full and compares it with what was written. Null when it is good. */
-    private fun verify(folder: BackupFolder, entry: FolderEntry, written: Manifest): String? {
-        val back: Backup = try {
-            folder.openInput(entry).use { BackupArchive.read(it) }
-        } catch (e: SecurityException) {
-            throw e
-        } catch (e: Exception) {
-            return describe(e)
-        }
-        val m = back.manifest
-        return when {
-            m.deviceId != written.deviceId -> "device id ${m.deviceId}, expected ${written.deviceId}"
-            m.eventCount != written.eventCount -> "${m.eventCount} events, expected ${written.eventCount}"
-            back.events.size.toLong() != written.eventCount -> "${back.events.size} events, expected ${written.eventCount}"
-            m.heads != written.heads -> "version vector differs"
-            m.files != written.files -> "checksums differ"
-            else -> null
-        }
+    /** The base and the pieces after it with no gap: empty when there is no base. */
+    private fun contiguous(files: Map<Long, FolderEntry>): List<FolderEntry> {
+        val out = ArrayList<FolderEntry>()
+        var s = 0L
+        while (true) out += files[s++] ?: break
+        return out
     }
 
-    // --- Merge steps ---
+    private fun readHeader(folder: BackupFolder, entry: FolderEntry, device: String, gen: Long, seq: Long): LogHeader =
+        folder.openInput(entry).use { LogFile.readHeader(it) }.also { checkName(it, entry, device, gen, seq) }
 
-    /** Other phones' latest/previous files, by device id. */
+    private fun readFile(folder: BackupFolder, entry: FolderEntry, device: String, gen: Long, seq: Long): LogFileData =
+        folder.openInput(entry).use { LogFile.read(it) }.also { checkName(it.header, entry, device, gen, seq) }
+
+    private fun checkName(h: LogHeader, entry: FolderEntry, device: String, gen: Long, seq: Long) {
+        if (h.deviceId != device || h.gen != gen || h.seq != seq) {
+            throw BackupException("${entry.name} says it is ${h.deviceId} g${h.gen} p${h.seq}")
+        }
+        if ((seq == 0L) != (h.kind == LogFileKind.BASE)) throw BackupException("${entry.name} is the wrong kind of file")
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Format 1 (phones on 6.1.1 or older): merged as before
+
     private fun phonesIn(entries: List<FolderEntry>): Map<String, Map<BackupRole, FolderEntry>> {
         val phones = sortedMapOf<String, MutableMap<BackupRole, FolderEntry>>()
         for (e in entries) {
@@ -438,14 +714,12 @@ class FolderBackups(
         return phones
     }
 
-    /** Merges one file. Returns the number of new events, or null when it was unchanged since last time. */
     private fun mergeOne(folder: BackupFolder, phone: String, entry: FolderEntry): Int? {
         val name = entry.name
         var current = entry
         val backup = try {
             readChecked(folder, current, phone)
         } catch (e: FileNotFoundException) {
-            // The phone may have been rotating its files at that moment: look again once.
             current = folder.list().firstOrNull { it.name == name } ?: throw e
             readChecked(folder, current, phone)
         } ?: return null
@@ -454,11 +728,6 @@ class FolderBackups(
         return added
     }
 
-    /**
-     * The checked backup in [entry], or null when its manifest alone shows nothing new: the same
-     * event log as merged last time, or (see [nothingNew]) nothing this phone lacks. A manifest
-     * that can't be read falls through to the full read, which checks the file and reports it.
-     */
     private fun readChecked(folder: BackupFolder, entry: FolderEntry, phone: String): Backup? {
         val m = try {
             folder.openInput(entry).use { BackupArchive.readManifest(it) }
@@ -481,13 +750,6 @@ class FolderBackups(
         return folder.openInput(entry).use { BackupArchive.read(it) }
     }
 
-    /**
-     * True when merging the backup with manifest [m] could add nothing: every device counter in
-     * its version vector is one this phone's log already reaches (each phone's events reach a
-     * log as a whole prefix, so the counter alone says which are there), and its legacy events
-     * are none, or the same set as merged from [phone] last time. Older manifests without the
-     * legacy fields, or from a newer format, say nothing here: they are read in full.
-     */
     private fun nothingNew(m: Manifest, phone: String, s: BackupState): Boolean {
         if (m.format > BackupArchive.FORMAT || m.deviceId != phone) return false
         val legacyKnown = when (val n = m.legacyCount) {
@@ -496,8 +758,7 @@ class FolderBackups(
             else -> n > 0 && m.legacyDigest != null && m.legacyDigest == s.mergedLegacy[phone]
         }
         if (!legacyKnown) return false
-        val local = fermata.loggedHeads()
-        return m.heads.all { (device, counter) -> counter <= (local[device] ?: 0L) }
+        return covered(m.heads, fermata.loggedHeads())
     }
 
     private fun remember(phone: String, sha: String?, legacyDigest: String?) {
@@ -517,7 +778,7 @@ class FolderBackups(
                 lastAttemptAt = result.at,
                 lastSuccessAt = result.at,
                 lastEventCount = result.eventCount,
-                lastBytes = result.bytes,
+                lastBytes = if (result.totalBytes > 0) result.totalBytes else result.bytes,
                 lastError = null,
                 lastErrorMessage = null,
             )
@@ -530,41 +791,33 @@ class FolderBackups(
         state.save(s.copy(status = status))
     }
 
-    private class CountingOutputStream(out: OutputStream) : FilterOutputStream(out) {
-        var count = 0L
-            private set
-
-        override fun write(b: Int) {
-            out.write(b)
-            count++
-        }
-
-        override fun write(b: ByteArray, off: Int, len: Int) {
-            out.write(b, off, len)
-            count += len
-        }
-    }
-
     companion object {
-        /** `previous` moves on at most this often (a day); `latest` is replaced on every backup. */
+        /** How often the restore point ("previous") moves on: at most once a day. */
         const val PREVIOUS_EVERY_MS = 24L * 60 * 60 * 1000
 
-        /** How far the clock may go back before `previous` moves on anyway (see [previousDue]). */
+        /** A chain with this many pieces is combined into a new base on the next backup. */
+        const val MAX_PIECES = 32L
+
+        /** Pieces are combined once they add up to half the base, and to at least this much. */
+        const val COMBINE_MIN_BYTES = 64L * 1024
+
+        /** A clock set back by more than this also moves the restore point on (else it would stick). */
         private const val CLOCK_SLACK_MS = 60L * 60 * 1000
 
-        /** Marks the temp name of a parked old `latest` (`minim-<device>-<time>-<nonce>-old.tmp`). */
-        private const val PARKED = "-old"
-        private const val PARKED_SUFFIX = PARKED + BackupNames.TEMP_EXTENSION
+        private const val CHAIN_KEY = "chain:"
+        private const val NOTHING_NEW = -1
 
-        /**
-         * One backup, restore or merge at a time, across every instance in the process: the
-         * on-close backup, the daily job and "Back up now" wait for each other, whichever thread
-         * or WorkManager job runs them.
-         */
+        /** One backup, restore or merge at a time, across every instance in the process. */
         private val LOCK = Any()
         private val random = SecureRandom()
 
         private fun nonce(): String = "%08x".format(random.nextInt())
+
+        private fun size(e: FolderEntry): Long = maxOf(e.size, 0L)
+
+        /** True when version vector [local] has everything [heads] counts. */
+        internal fun covered(heads: Map<String, Long>, local: Map<String, Long>): Boolean =
+            heads.all { (device, counter) -> counter <= (local[device] ?: 0L) }
 
         private fun describe(e: Throwable): String = when (e) {
             is FileNotFoundException -> "file not found: ${e.message}"

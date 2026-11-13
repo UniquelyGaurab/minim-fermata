@@ -15,12 +15,20 @@ enum class BackupRole {
 /** A backup file name, taken apart. [deviceId] is null for [BackupRole.DAILY] names (read it from the manifest). */
 data class BackupName(val deviceId: String?, val role: BackupRole)
 
+/** A format-2 file name, taken apart: generation [gen], and piece [seq] (0 for the base). */
+data class ChainName(val deviceId: String, val gen: Long, val seq: Long) {
+    val isBase: Boolean get() = seq == 0L
+}
+
 /**
  * File names in the backup folder. Each phone writes only its own files, named by its device id,
  * so two phones sharing a synced folder never write the same file:
  *
  * - `minim-<device>-latest.minim` and `minim-<device>-previous.minim`: one pair per phone
  * - `minim-<device>-<nonce>.tmp`: a backup being written. Readers ignore it (wrong extension).
+ * - Format 2 (Minim 6.2): `minim-<device>-g<gen>-base.fermata`, the phone's whole log, and
+ *   `minim-<device>-g<gen>-p<seq>.fermata`, the events after piece `seq - 1` (or the base).
+ *   Written once, never changed; see DESIGN.md.
  */
 object BackupNames {
     private const val PREFIX = "minim-"
@@ -56,6 +64,32 @@ object BackupNames {
         val suffix = if (role == BackupRole.LATEST) LATEST_SUFFIX else PREVIOUS_SUFFIX
         val device = name.substring(PREFIX.length, name.length - suffix.length)
         return if (isValidDeviceId(device)) BackupName(device, role) else null
+    }
+
+    fun chainBase(deviceId: String, gen: Long): String {
+        require(gen >= 1)
+        return PREFIX + checked(deviceId) + "-g" + gen.toString().padStart(3, '0') + "-base" + LogFile.EXTENSION
+    }
+
+    fun chainPiece(deviceId: String, gen: Long, seq: Long): String {
+        require(gen >= 1 && seq >= 1)
+        return PREFIX + checked(deviceId) + "-g" + gen.toString().padStart(3, '0') + "-p" + seq.toString().padStart(4, '0') + LogFile.EXTENSION
+    }
+
+    fun chainFile(deviceId: String, gen: Long, seq: Long): String =
+        if (seq == 0L) chainBase(deviceId, gen) else chainPiece(deviceId, gen, seq)
+
+    private val chainPattern = Regex("minim-([A-Za-z0-9_-]{1,64})-g([0-9]{1,18})-(?:base|p([0-9]{1,18}))\\.fermata")
+
+    /** Takes a format-2 file name apart, or returns null for anything else. */
+    fun parseChain(name: String): ChainName? {
+        val m = chainPattern.matchEntire(name) ?: return null
+        val device = m.groupValues[1]
+        if (!isValidDeviceId(device)) return null
+        val gen = m.groupValues[2].toLongOrNull() ?: return null
+        val seq = m.groupValues[3].takeIf { it.isNotEmpty() }?.let { it.toLongOrNull() ?: return null } ?: 0L
+        if (gen < 1 || (m.groupValues[3].isNotEmpty() && seq < 1)) return null
+        return ChainName(device, gen, seq)
     }
 
     private fun checked(deviceId: String): String {

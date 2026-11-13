@@ -30,7 +30,7 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
         val mergedLegacy = prefs.all.entries
             .filter { it.key.startsWith(K_MERGED_LEGACY_PREFIX) && it.value is String }
             .associate { it.key.removePrefix(K_MERGED_LEGACY_PREFIX) to it.value as String }
-        BackupState(status, merged, prefs.getBoolean(K_DISMISSED, false), long(K_ROTATED), mergedLegacy)
+        BackupState(status, merged, prefs.getBoolean(K_DISMISSED, false), long(K_ROTATED), mergedLegacy, prefs.getLong(K_LAST_GEN, 0L))
     }
 
     override fun save(state: BackupState) = synchronized(this) {
@@ -54,6 +54,7 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
         for ((device, digest) in state.mergedLegacy) e.putString(K_MERGED_LEGACY_PREFIX + device, digest)
         e.putBoolean(K_DISMISSED, state.restoreOfferDismissed)
         putLong(e, K_ROTATED, state.previousRotatedAt)
+        e.putLong(K_LAST_GEN, state.lastGen)
         e.commit()
         Unit
     }
@@ -80,5 +81,6 @@ class PrefsBackupStateStore(private val prefs: SharedPreferences) : BackupStateS
         // Not under "merged.": that prefix holds only the event log checksums.
         const val K_MERGED_LEGACY_PREFIX = "merged_legacy."
         const val K_ROTATED = "previous_rotated_at"
+        const val K_LAST_GEN = "last_gen"
     }
 }

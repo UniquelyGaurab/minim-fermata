@@ -43,12 +43,15 @@ sealed interface BackupResult {
         override val at: Long,
         val fileName: String,
         val eventCount: Long,
+        /** Bytes of the file this backup wrote (a small piece, usually), or of the newest file when [written] is false. */
         val bytes: Long,
         /**
-         * False when [FolderBackups.backUpIfChanged] found that this phone's `latest` already
-         * holds everything in the log, so nothing was written.
+         * False when nothing was written: [FolderBackups.backUpIfChanged] found that this phone's
+         * backup already holds everything in the log, or nothing was new.
          */
         val written: Boolean = true,
+        /** Bytes of every file a restore of this backup reads (the base and its pieces); 0 when unknown. */
+        val totalBytes: Long = 0,
     ) : BackupResult
 
     data class Failure(override val at: Long, val error: BackupError, val message: String) : BackupResult
@@ -96,6 +99,11 @@ data class BackupState(
      * merge can skip a changed backup whose manifest shows nothing new (see [FolderBackups.mergeFromFolder]).
      */
     val mergedLegacy: Map<String, String> = emptyMap(),
+    /**
+     * The highest backup generation this phone has written (format 2), so a new one never takes
+     * an old one's name even when the folder lost every file of this phone. 0 before 6.2.
+     */
+    val lastGen: Long = 0,
 )
 
 /** Where [BackupState] is kept: SharedPreferences on Android, memory in tests. */

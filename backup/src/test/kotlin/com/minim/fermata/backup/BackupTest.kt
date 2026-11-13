@@ -30,7 +30,7 @@ class BackupTest {
     private val bare = TrackRef("bare")
 
     /** One of every event type, with and without optional fields. */
-    private fun everyType(): List<Event> {
+    internal fun everyType(): List<Event> {
         val d = TestDevice("3f9a0c5e1b7d2468")
         var t = T0
         fun next() = (t + MINUTE).also { t = it }

@@ -120,16 +120,21 @@ class SqliteEventStore private constructor(
             if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
         }
 
-    override fun after(heads: Map<String, Long>): List<Event> {
+    override fun after(heads: Map<String, Long>): List<Event> = afterQuery(heads, withLegacy = true)
+
+    override fun deviceEventsAfter(heads: Map<String, Long>): List<Event> = afterQuery(heads, withLegacy = false)
+
+    private fun afterQuery(heads: Map<String, Long>, withLegacy: Boolean): List<Event> {
         // Small vectors in practice (a few devices), so filter in SQL per device.
-        val clauses = StringBuilder("device = ?")
-        val args = arrayListOf(EventId.LEGACY_DEVICE)
+        val clauses = StringBuilder(if (withLegacy) "device = ?" else "0")
+        val args = if (withLegacy) arrayListOf(EventId.LEGACY_DEVICE) else arrayListOf()
         val known = heads.filterKeys { it != EventId.LEGACY_DEVICE }
         if (known.isEmpty()) {
-            clauses.append(" OR 1")
+            if (withLegacy) clauses.append(" OR 1") else clauses.append(" OR device != ?").also { args.add(EventId.LEGACY_DEVICE) }
         } else {
-            clauses.append(" OR device NOT IN (").append(known.keys.joinToString(",") { "?" }).append(")")
+            clauses.append(" OR device NOT IN (").append((known.keys + EventId.LEGACY_DEVICE).joinToString(",") { "?" }).append(")")
             args.addAll(known.keys)
+            args.add(EventId.LEGACY_DEVICE)
             for ((device, counter) in known) {
                 clauses.append(" OR (device = ? AND counter > ?)")
                 args.add(device)

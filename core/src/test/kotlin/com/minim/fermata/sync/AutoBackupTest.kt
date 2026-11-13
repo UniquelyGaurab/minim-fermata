@@ -142,8 +142,8 @@ class AutoBackupTest {
 
         val first = assertIs<BackupResult.Success>(backups.backUpIfChanged(folder))
         assertTrue(first.written)
-        assertEquals(listOf("minim-phoneA-latest.minim"), names())
-        val bytes = File(dir, "minim-phoneA-latest.minim").readBytes()
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
+        val bytes = File(dir, "minim-phoneA-g001-base.fermata").readBytes()
 
         repeat(5) {
             clock.now += 5 * MINUTE
@@ -151,14 +151,14 @@ class AutoBackupTest {
             val again = assertIs<BackupResult.Success>(backups.backUpIfChanged(folder))
             assertFalse(again.written)
             assertEquals(2L, again.eventCount)
-            assertEquals("minim-phoneA-latest.minim", again.fileName)
+            assertEquals("minim-phoneA-g001-base.fermata", again.fileName)
             assertEquals(bytes.size.toLong(), again.bytes)
             assertEquals(0, folder.creates, "nothing written")
             assertEquals(0, folder.renames)
-            assertEquals(mapOf("minim-phoneA-latest.minim" to 1), folder.opens, "only the manifest is read")
+            assertEquals(mapOf("minim-phoneA-g001-base.fermata" to 1), folder.opens, "only the header is read")
         }
-        assertTrue(bytes.contentEquals(File(dir, "minim-phoneA-latest.minim").readBytes()))
-        assertEquals(listOf("minim-phoneA-latest.minim"), names())
+        assertTrue(bytes.contentEquals(File(dir, "minim-phoneA-g001-base.fermata").readBytes()))
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
         val status = backups.status()
         assertTrue(status.ok)
         assertEquals(clock.now, status.lastSuccessAt, "a current latest counts as a backup that worked")
@@ -176,7 +176,7 @@ class AutoBackupTest {
             clock.now += MINUTE
             val r = assertIs<BackupResult.Success>(backups.backUpIfChanged(folder), what)
             assertTrue(r.written, what)
-            assertEquals(f.eventCount(), read("minim-phoneA-latest.minim").manifest.eventCount, what)
+            assertEquals(f.eventCount(), latestCount("phoneA"), what)
             assertFalse(assertIs<BackupResult.Success>(backups.backUpIfChanged(folder)).written, "$what, then nothing")
         }
 
@@ -197,24 +197,23 @@ class AutoBackupTest {
     }
 
     @Test
-    fun `backUpIfChanged writes when latest is missing, damaged or another format`() {
+    fun `backUpIfChanged writes when this phone's backup is missing or damaged`() {
         val f = fermata("phoneA")
         f.play(a)
         val backups = FolderBackups(f, InMemoryBackupStateStore(), clock = clock)
         val folder = FileBackupFolder(dir)
         backups.backUp(folder)
-        val latest = File(dir, "minim-phoneA-latest.minim")
+        val base = File(dir, "minim-phoneA-g001-base.fermata")
 
-        latest.delete()
+        base.delete()
         assertTrue(assertIs<BackupResult.Success>(backups.backUpIfChanged(folder)).written, "missing")
+        assertEquals(listOf("minim-phoneA-g002-base.fermata"), names(), "a new generation, never an old name")
 
-        latest.writeBytes("not a zip".toByteArray())
+        val second = File(dir, "minim-phoneA-g002-base.fermata")
+        second.writeBytes("not a backup".toByteArray())
         assertTrue(assertIs<BackupResult.Success>(backups.backUpIfChanged(folder)).written, "damaged")
-        assertEquals(1L, read(latest.name).manifest.eventCount)
-
-        rewriteManifest(latest) { it + ("format" to Json.parseToJsonElement("99")) }
-        assertTrue(assertIs<BackupResult.Success>(backups.backUpIfChanged(folder)).written, "another format")
-        assertEquals(BackupArchive.FORMAT, read(latest.name).manifest.format)
+        assertEquals(listOf("minim-phoneA-g003-base.fermata"), names(), "a new generation; the damaged one is gone")
+        assertEquals(1L, latestCount("phoneA"))
 
         assertEquals(BackupError.NO_FOLDER, assertIs<BackupResult.Failure>(backups.backUpIfChanged(null)).error)
     }
@@ -238,18 +237,6 @@ class AutoBackupTest {
     }
 
     @Test
-    fun `a backup from before the legacy fields is still recognised as current`() {
-        val f = fermata("phoneA")
-        f.play(a)
-        val backups = FolderBackups(f, InMemoryBackupStateStore(), clock = clock)
-        backups.backUp(FileBackupFolder(dir))
-        rewriteManifest(File(dir, "minim-phoneA-latest.minim")) { it - "legacyCount" - "legacyDigest" }
-        assertFalse(assertIs<BackupResult.Success>(backups.backUpIfChanged(FileBackupFolder(dir))).written)
-    }
-
-    // --- 2. previous moves on at most once a day ---
-
-    @Test
     fun `latest moves on with every backup, previous at most once a day`() {
         val f = fermata("phoneA")
         val state = InMemoryBackupStateStore()
@@ -260,7 +247,7 @@ class AutoBackupTest {
         f.play(b)
         backups.backUp(folder) // no previous yet: latest becomes previous
         val rotatedAt = clock.now
-        assertEquals(1L, read("minim-phoneA-previous.minim").manifest.eventCount)
+        assertEquals(1L, previousCount("phoneA"))
 
         // Back up every 5 minutes for most of a day, with a new play each time.
         var expectedLatest = 2L
@@ -269,9 +256,10 @@ class AutoBackupTest {
             f.play(c)
             expectedLatest++
             assertTrue(assertIs<BackupResult.Success>(backups.backUpIfChanged(folder)).written)
-            assertEquals(expectedLatest, read("minim-phoneA-latest.minim").manifest.eventCount)
-            assertEquals(1L, read("minim-phoneA-previous.minim").manifest.eventCount, "previous stays for the day")
-            assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names(), "no parked files left")
+            assertEquals(expectedLatest, latestCount("phoneA"))
+            assertEquals(1L, previousCount("phoneA"), "previous stays for the day")
+            assertTrue(names().none { it.endsWith(".tmp") }, "no temp files left")
+            assertTrue(names().size <= FolderBackups.MAX_PIECES + 3, "old pieces are cleaned up")
         }
         assertTrue(expectedLatest > 250)
 
@@ -279,8 +267,8 @@ class AutoBackupTest {
         clock.now = rotatedAt + FolderBackups.PREVIOUS_EVERY_MS
         f.play(a)
         backups.backUp(folder)
-        assertEquals(expectedLatest, read("minim-phoneA-previous.minim").manifest.eventCount)
-        assertEquals(expectedLatest + 1, read("minim-phoneA-latest.minim").manifest.eventCount)
+        assertEquals(expectedLatest, previousCount("phoneA"))
+        assertEquals(expectedLatest + 1, latestCount("phoneA"))
         assertEquals(clock.now, state.load().previousRotatedAt)
     }
 
@@ -292,7 +280,7 @@ class AutoBackupTest {
         val folder = FileBackupFolder(dir)
         f.play(a); backups.backUp(folder)
         f.play(a); backups.backUp(folder) // previous = 1 event, moved on now
-        fun previousCount() = read("minim-phoneA-previous.minim").manifest.eventCount
+        fun previousCount() = previousCount("phoneA")
         fun backUpNew() { f.play(b); clock.now -= 3 * MINUTE; backups.backUp(folder) }
 
         // Set back a little (a time sync): previous stays.
@@ -329,63 +317,10 @@ class AutoBackupTest {
     }
 
     @Test
-    fun `replacing latest in place puts the old one back when the new one cannot move in`() {
-        val f = fermata("phoneA")
-        val folder = CountingFolder(FileBackupFolder(dir))
-        val backups = FolderBackups(f, InMemoryBackupStateStore(), clock = clock)
-        f.play(a); backups.backUp(folder)
-        f.play(b); backups.backUp(folder) // latest 2, previous 1
-        f.play(c)
-        folder.failRenameTo = "minim-phoneA-latest.minim"
-        folder.failOnce = true
-        assertEquals(BackupError.RENAME_FAILED, assertIs<BackupResult.Failure>(backups.backUp(folder)).error)
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
-        assertEquals(2L, read("minim-phoneA-latest.minim").manifest.eventCount)
-        assertEquals(1L, read("minim-phoneA-previous.minim").manifest.eventCount)
-
-        // If even the way back fails, the old latest waits under its temp name (which no reader
-        // takes) and the next run puts it back before anything else.
-        folder.failRenameTo = "minim-phoneA-latest.minim"
-        folder.failOnce = false
-        assertEquals(BackupError.RENAME_FAILED, assertIs<BackupResult.Failure>(backups.backUp(folder)).error)
-        assertEquals(1, names().count { it.endsWith("-old.tmp") })
-        folder.failRenameTo = null
-        assertTrue(assertIs<BackupResult.Success>(backups.backUpIfChanged(folder)).written)
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
-        assertEquals(3L, read("minim-phoneA-latest.minim").manifest.eventCount)
-        assertEquals(1L, read("minim-phoneA-previous.minim").manifest.eventCount)
-    }
-
-    @Test
-    fun `a run killed while latest was parked gets it back on the next run`() {
-        val f = fermata("phoneA")
-        val folder = CountingFolder(FileBackupFolder(dir))
-        val backups = FolderBackups(f, InMemoryBackupStateStore(), clock = clock)
-        f.play(a); backups.backUp(folder)
-        f.play(b); backups.backUp(folder)
-        // As a kill would leave it: latest parked, the new temp half written, no latest.
-        File(dir, "minim-phoneA-latest.minim").renameTo(File(dir, "minim-phoneA-${clock.now}-abcd-old.tmp"))
-        File(dir, "minim-phoneA-${clock.now}-ef01.tmp").writeText("half")
-
-        f.play(c)
-        folder.failCreate = true // and this run cannot write either
-        assertIs<BackupResult.Failure>(backups.backUp(folder))
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
-        assertEquals(2L, read("minim-phoneA-latest.minim").manifest.eventCount, "the parked latest is back")
-
-        folder.failCreate = false
-        assertTrue(assertIs<BackupResult.Success>(backups.backUp(folder)).written)
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
-        assertEquals(3L, read("minim-phoneA-latest.minim").manifest.eventCount)
-    }
-
-    // --- 3. the manifest-first merge ---
-
-    @Test
-    fun `a merge reads a backup in full only when its manifest shows something new`() {
+    fun `a merge reads a pre-6_2 backup in full only when its manifest shows something new`() {
         val folder = CountingFolder(FileBackupFolder(dir))
         val phoneB = fermata("phoneB")
-        val bBackups = FolderBackups(phoneB, InMemoryBackupStateStore(), clock = clock)
+        val bBackups = Format1Backups(phoneB, InMemoryBackupStateStore(), clock = clock)
         phoneB.play(a)
         bBackups.backUp(folder)
 
@@ -402,7 +337,7 @@ class AutoBackupTest {
         assertEquals(2, folder.opens["minim-phoneB-latest.minim"], "manifest, then the whole file")
 
         // B merges A in and backs up: its file changed, but holds nothing A lacks.
-        bBackups.mergeFromFolder(folder)
+        phoneB.merge(phoneA.events()) // a 6.1.1 phone can't read 6.2's files: A's events come another way
         assertTrue(assertIs<BackupResult.Success>(bBackups.backUpIfChanged(folder)).written)
         folder.reset()
         val second = aBackups.mergeFromFolder(folder)
@@ -428,10 +363,10 @@ class AutoBackupTest {
     }
 
     @Test
-    fun `legacy events, which have no counters, make a merge read in full until it has them`() {
+    fun `legacy events in a pre-6_2 backup, which have no counters, make a merge read in full until it has them`() {
         val folder = CountingFolder(FileBackupFolder(dir))
         val phoneB = fermata("phoneB")
-        val bBackups = FolderBackups(phoneB, InMemoryBackupStateStore(), clock = clock)
+        val bBackups = Format1Backups(phoneB, InMemoryBackupStateStore(), clock = clock)
         phoneB.importEvents(listOf(legacyLike("likes:A", a)))
         phoneB.play(b)
         bBackups.backUp(folder)
@@ -452,7 +387,7 @@ class AutoBackupTest {
         assertTrue(phoneA.library().isLiked("A"))
 
         // B takes A's events in and backs up: same legacy set, nothing new: the manifest alone.
-        bBackups.mergeFromFolder(folder)
+        phoneB.merge(phoneA.events()) // a 6.1.1 phone can't read 6.2's files: A's events come another way
         bBackups.backUpIfChanged(folder)
         folder.reset()
         assertEquals(1, aBackups.mergeFromFolder(folder).unchanged)
@@ -468,11 +403,11 @@ class AutoBackupTest {
     }
 
     @Test
-    fun `an older manifest without the legacy fields is read in full`() {
+    fun `an older pre-6_2 manifest without the legacy fields is read in full`() {
         val folder = CountingFolder(FileBackupFolder(dir))
         val phoneB = fermata("phoneB")
         phoneB.play(a)
-        FolderBackups(phoneB, InMemoryBackupStateStore(), clock = clock).backUp(folder)
+        Format1Backups(phoneB, InMemoryBackupStateStore(), clock = clock).backUp(folder)
         rewriteManifest(File(dir, "minim-phoneB-latest.minim")) { it - "legacyCount" - "legacyDigest" }
         val phoneA = fermata("phoneA")
         phoneA.merge(phoneB.events()) // A has everything already
@@ -484,10 +419,10 @@ class AutoBackupTest {
     }
 
     @Test
-    fun `a damaged or missing manifest falls back to the full read and then to previous`() {
+    fun `a pre-6_2 backup with a damaged or missing manifest falls back to the full read and then to previous`() {
         val folder = FileBackupFolder(dir)
         val phoneB = fermata("phoneB")
-        val bBackups = FolderBackups(phoneB, InMemoryBackupStateStore(), clock = clock)
+        val bBackups = Format1Backups(phoneB, InMemoryBackupStateStore(), clock = clock)
         phoneB.play(a); bBackups.backUp(folder)
         phoneB.play(b); bBackups.backUp(folder) // latest 2, previous 1
         val latest = File(dir, "minim-phoneB-latest.minim")
@@ -546,11 +481,20 @@ class AutoBackupTest {
         results.forEach { assertIs<BackupResult.Success>(it.get(60, TimeUnit.SECONDS)) }
         pool.shutdown()
         assertEquals(1, folder.mostAtOnce.get(), "one folder call at a time")
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim", "minim-phoneB-latest.minim"), names())
-        assertEquals(phoneA.eventCount(), read("minim-phoneA-latest.minim").manifest.eventCount)
+        assertTrue(names().none { it.endsWith(".tmp") })
+        assertTrue(names().all { it.startsWith("minim-phoneA-g001-") || it == "minim-phoneB-g001-base.fermata" }, names().toString())
+        assertEquals(phoneA.eventCount(), latestCount("phoneA"))
     }
 
     // --- helpers ---
+
+    private fun reader() = FolderBackups(fermata("reader"), InMemoryBackupStateStore(), clock = clock)
+
+    private fun latestCount(device: String): Long =
+        reader().list(FileBackupFolder(dir)).single { it.deviceId == device && it.role == com.minim.fermata.backup.BackupRole.LATEST }.eventCount!!
+
+    private fun previousCount(device: String): Long =
+        reader().list(FileBackupFolder(dir)).single { it.deviceId == device && it.role == com.minim.fermata.backup.BackupRole.PREVIOUS }.eventCount!!
 
     private fun rewriteManifest(file: File, change: (JsonObject) -> Map<String, kotlinx.serialization.json.JsonElement>) =
         rewriteZip(file) { name, bytes ->

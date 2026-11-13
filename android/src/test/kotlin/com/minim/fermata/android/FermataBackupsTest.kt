@@ -11,6 +11,8 @@ import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
 import com.minim.fermata.Fermata
 import com.minim.fermata.backup.BackupArchive
+import com.minim.fermata.backup.BackupRole
+import com.minim.fermata.backup.LogFile
 import com.minim.fermata.log.EventBody
 import com.minim.fermata.log.EventId
 import com.minim.fermata.log.InMemoryEventStore
@@ -104,10 +106,13 @@ class FermataBackupsTest {
 
     private fun names() = dir.list()!!.sorted()
 
-    private fun read(name: String) = File(dir, name).inputStream().use { BackupArchive.read(it) }
+    private fun read(name: String) = File(dir, name).inputStream().use { LogFile.read(it) }
+
+    private fun info(backups: FermataBackups, device: String, role: BackupRole) =
+        backups.listBackups().single { it.deviceId == device && it.role == role }
 
     @Test
-    fun backUpNowWritesTempVerifiesAndRotatesThroughSaf() {
+    fun backUpNowWritesTempVerifiesAndAddsPiecesThroughSaf() {
         val (f, _) = phone("phoneA")
         f.plays(a, b)
         val backups = FermataBackups(context, f, "5.10.0")
@@ -117,15 +122,16 @@ class FermataBackupsTest {
         backups.setFolder(TestDocumentsProvider.tree)
         assertTrue(backups.hasFolderAccess())
         val first = assertIs<BackupResult.Success>(backups.backUpNow())
-        assertEquals("minim-phoneA-latest.minim", first.fileName)
-        assertEquals(listOf("minim-phoneA-latest.minim"), names())
+        assertEquals("minim-phoneA-g001-base.fermata", first.fileName)
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
 
         f.plays(c)
         assertIs<BackupResult.Success>(backups.backUpNow())
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
-        assertEquals(3L, read("minim-phoneA-latest.minim").manifest.eventCount)
-        assertEquals(2L, read("minim-phoneA-previous.minim").manifest.eventCount)
-        assertEquals("5.10.0", read("minim-phoneA-latest.minim").manifest.appVersion)
+        assertEquals(listOf("minim-phoneA-g001-base.fermata", "minim-phoneA-g001-p0001.fermata"), names())
+        assertEquals(1, read("minim-phoneA-g001-p0001.fermata").events.size, "the piece holds only the new play")
+        assertEquals(3L, info(backups, "phoneA", BackupRole.LATEST).eventCount)
+        assertEquals(2L, info(backups, "phoneA", BackupRole.PREVIOUS).eventCount)
+        assertEquals("5.10.0", info(backups, "phoneA", BackupRole.LATEST).appVersion)
 
         // The status survives the app restarting (a new instance reads it back).
         val status = FermataBackups(context, f).status()
@@ -135,19 +141,19 @@ class FermataBackupsTest {
     }
 
     @Test
-    fun aCorruptWriteIsCaughtAndTheOldLatestStays() {
+    fun aCorruptWriteIsCaughtAndTheOldFilesStay() {
         val (f, _) = phone("phoneA")
         f.plays(a)
         val backups = FermataBackups(context, f).apply { setFolder(TestDocumentsProvider.tree) }
         backups.backUpNow()
-        val good = File(dir, "minim-phoneA-latest.minim").readBytes()
+        val good = File(dir, "minim-phoneA-g001-base.fermata").readBytes()
 
         f.plays(b, c)
         provider.corruptReads = true
         val failed = assertIs<BackupResult.Failure>(backups.backUpNow())
         assertEquals(BackupError.VERIFY_FAILED, failed.error)
-        assertEquals(listOf("minim-phoneA-latest.minim"), names())
-        assertTrue(good.contentEquals(File(dir, "minim-phoneA-latest.minim").readBytes()))
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
+        assertTrue(good.contentEquals(File(dir, "minim-phoneA-g001-base.fermata").readBytes()))
         assertEquals(BackupError.VERIFY_FAILED, backups.status().lastError)
 
         provider.corruptReads = false
@@ -156,16 +162,16 @@ class FermataBackupsTest {
     }
 
     @Test
-    fun aFailedRenameRollsBackToTheOldLatest() {
+    fun aFailedRenameLeavesTheOldFilesAsTheyWere() {
         val (f, _) = phone("phoneA")
         f.plays(a)
         val backups = FermataBackups(context, f).apply { setFolder(TestDocumentsProvider.tree) }
         backups.backUpNow()
         f.plays(b)
-        provider.failRenameTo = "minim-phoneA-previous.minim"
+        provider.failRenameTo = "minim-phoneA-g001-p0001.fermata"
         assertEquals(BackupError.RENAME_FAILED, assertIs<BackupResult.Failure>(backups.backUpNow()).error)
-        assertEquals(listOf("minim-phoneA-latest.minim"), names())
-        assertEquals(1L, read("minim-phoneA-latest.minim").manifest.eventCount)
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
+        assertEquals(1L, info(backups, "phoneA", BackupRole.LATEST).eventCount)
     }
 
     @Test
@@ -241,7 +247,7 @@ class FermataBackupsTest {
         val donor = Fermata(InMemoryEventStore(), "donor", clock, ZoneOffset.UTC)
         donor.plays(a, b)
         FolderBackups(donor, InMemoryBackupStateStore(), clock = clock).backUp(FileBackupFolder(dir))
-        val file = File(dir, "minim-donor-latest.minim")
+        val file = File(dir, "minim-donor-g001-base.fermata")
         val good = file.readBytes()
         File(dir, "minim-junk-latest.minim").writeText("<html>sign in to your cloud</html>")
 
@@ -251,13 +257,13 @@ class FermataBackupsTest {
         assertFalse(list.single { it.fileName == "minim-junk-latest.minim" }.restorable)
         val info = list.single { it.deviceId == "donor" }
 
-        file.writeBytes(good.copyOf(eventsDataStart(good) + 10))
+        file.writeBytes(good.copyOf(good.size - 10))
         assertEquals(BackupError.DAMAGED, assertIs<RestoreResult.Failure>(backups.restore(info)).error)
         assertEquals(0L, store.count())
-        // Only that phone's previous would be used by a merge; with none, it is reported and retried.
+        // A merge reports it and tries again next time.
         val merge = backups.merge()
         assertEquals(0, merge.eventsAdded)
-        assertEquals(setOf("minim-donor-latest.minim", "minim-junk-latest.minim"), merge.problems.map { it.fileName }.toSet())
+        assertEquals(setOf("minim-donor-g001-base.fermata", "minim-junk-latest.minim"), merge.problems.map { it.fileName }.toSet())
 
         file.writeBytes(good)
         assertEquals(2, backups.merge().eventsAdded)
@@ -277,7 +283,7 @@ class FermataBackupsTest {
         assertEquals(mapOf("A" to 1, "B" to 1), lib.playCounts)
         // And the next backup is in the new format, under this phone's own name.
         assertIs<BackupResult.Success>(backups.backUpNow())
-        assertTrue("minim-phoneA-latest.minim" in names())
+        assertTrue("minim-phoneA-g001-base.fermata" in names())
         assertTrue("minim-backup-2026-11-01.minim" in names()) // never deleted
     }
 
@@ -309,7 +315,7 @@ class FermataBackupsTest {
         assertEquals(2, backups.merge().unchanged)
 
         assertIs<BackupResult.Success>(backups.backUpNow())
-        assertEquals(6L, read("minim-phoneA-latest.minim").manifest.eventCount)
+        assertEquals(6L, info(backups, "phoneA", BackupRole.LATEST).eventCount)
         assertTrue(File(dir, "minim-phoneB-99-0badf00d.tmp").exists()) // another phone's file: untouched
 
         // Phone B adds one more; only that comes over.
@@ -343,7 +349,7 @@ class FermataBackupsTest {
 
         val worker = TestListenableWorkerBuilder<BackupWorker>(context).build()
         assertEquals(ListenableWorker.Result.success(), worker.doWork())
-        assertEquals(listOf("minim-phoneA-latest.minim"), names())
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
         assertTrue(backups.status().ok)
         assertNotNull(backups.status().lastMergeAt)
 
@@ -372,7 +378,7 @@ class FermataBackupsTest {
         clock.now += 86_400_000L
         f.plays(b)
         backups.backUpNow()
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
+        assertEquals(listOf("minim-phoneA-g001-base.fermata", "minim-phoneA-g001-p0001.fermata"), names())
 
         val wm = WorkManager.getInstance(context)
         backups.enqueueBackupOnce()
@@ -387,10 +393,12 @@ class FermataBackupsTest {
         val worker = TestListenableWorkerBuilder<BackupWorker>(context)
             .setInputData(androidx.work.workDataOf(BackupWorker.REPLACE_PREVIOUS to true)).build()
         assertEquals(ListenableWorker.Result.success(), worker.doWork())
-        val latest = read("minim-phoneA-latest.minim")
-        val previous = read("minim-phoneA-previous.minim")
-        assertEquals(latest.manifest.eventCount, previous.manifest.eventCount)
-        assertTrue(previous.events.none { it.body is EventBody.Play }, "the cleared plays are in neither file")
+        // One new base, which is the restore point too: the cleared plays are in no file.
+        val name = names().single()
+        assertTrue(Regex("minim-phoneA-g00[23]-base\\.fermata").matches(name), name)
+        val base = read(name)
+        assertTrue(base.events.none { it.body is EventBody.Play }, "the cleared plays are gone")
+        assertEquals(com.minim.fermata.backup.ChainPoint(base.header.gen, 0, base.header.createdAt), base.header.restorePoint)
     }
 
     @Test
@@ -458,20 +466,22 @@ class FermataBackupsTest {
             .setInputData(androidx.work.workDataOf(BackupWorker.MODE to BackupWorker.MODE_ON_CLOSE)).build().doWork()
         assertEquals(ListenableWorker.Result.success(), onClose())
         assertEquals(1, prepared, "batched history is recorded first")
-        assertEquals(listOf("minim-phoneA-latest.minim"), names())
-        val modified = File(dir, "minim-phoneA-latest.minim").lastModified()
-        val bytes = File(dir, "minim-phoneA-latest.minim").readBytes()
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
+        val modified = File(dir, "minim-phoneA-g001-base.fermata").lastModified()
+        val bytes = File(dir, "minim-phoneA-g001-base.fermata").readBytes()
 
         Thread.sleep(20)
         assertEquals(ListenableWorker.Result.success(), onClose())
-        assertTrue(bytes.contentEquals(File(dir, "minim-phoneA-latest.minim").readBytes()), "nothing changed: nothing written")
-        assertEquals(modified, File(dir, "minim-phoneA-latest.minim").lastModified())
+        assertTrue(bytes.contentEquals(File(dir, "minim-phoneA-g001-base.fermata").readBytes()), "nothing changed: nothing written")
+        assertEquals(modified, File(dir, "minim-phoneA-g001-base.fermata").lastModified())
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
         assertNull(backups.status().lastMergeAt, "the on-close job does not merge")
 
         f.plays(b)
         assertEquals(ListenableWorker.Result.success(), onClose())
-        assertEquals(2L, read("minim-phoneA-latest.minim").manifest.eventCount)
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names())
+        assertEquals(listOf("minim-phoneA-g001-base.fermata", "minim-phoneA-g001-p0001.fermata"), names(), "one small piece for the new play")
+        assertEquals(1, read("minim-phoneA-g001-p0001.fermata").events.size)
+        assertEquals(2L, backups.listBackups().single { it.role == BackupRole.LATEST }.eventCount)
         assertTrue(backups.status().ok)
     }
 
@@ -496,7 +506,7 @@ class FermataBackupsTest {
         assertEquals(ListenableWorker.Result.success(), onOpen())
         assertEquals(2L, f.eventCount())
         assertEquals(1, app.changed, "the app is told the log changed")
-        assertEquals(listOf("minim-phoneB-latest.minim"), names(), "the on-open job does not back up")
+        assertEquals(listOf("minim-phoneB-g001-base.fermata"), names(), "the on-open job does not back up")
 
         assertEquals(ListenableWorker.Result.success(), onOpen())
         assertEquals(1, app.changed, "nothing new: not told again")
@@ -521,17 +531,20 @@ class FermataBackupsTest {
         backups.setFolder(TestDocumentsProvider.tree)
         f.plays(a)
         backups.backUpNow()
-        val bytes = File(dir, "minim-phoneA-latest.minim").readBytes()
+        val bytes = File(dir, "minim-phoneA-g001-base.fermata").readBytes()
         assertEquals(ListenableWorker.Result.success(), TestListenableWorkerBuilder<BackupWorker>(context).build().doWork())
-        assertTrue(bytes.contentEquals(File(dir, "minim-phoneA-latest.minim").readBytes()), "daily: unchanged, not written")
-        assertEquals(listOf("minim-phoneA-latest.minim"), names())
+        assertTrue(bytes.contentEquals(File(dir, "minim-phoneA-g001-base.fermata").readBytes()), "daily: unchanged, not written")
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
 
-        assertEquals(
-            ListenableWorker.Result.success(),
-            TestListenableWorkerBuilder<BackupWorker>(context)
-                .setInputData(androidx.work.workDataOf(BackupWorker.MODE to BackupWorker.MODE_NOW)).build().doWork(),
-        )
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), names(), "Back up now writes anyway")
+        // Back up now goes through the full backup, but a chain that already holds everything
+        // gets no empty piece: files are only ever written for new events.
+        val now = TestListenableWorkerBuilder<BackupWorker>(context)
+            .setInputData(androidx.work.workDataOf(BackupWorker.MODE to BackupWorker.MODE_NOW)).build()
+        assertEquals(ListenableWorker.Result.success(), now.doWork())
+        assertEquals(listOf("minim-phoneA-g001-base.fermata"), names())
+        f.plays(b)
+        assertEquals(ListenableWorker.Result.success(), now.doWork())
+        assertEquals(listOf("minim-phoneA-g001-base.fermata", "minim-phoneA-g001-p0001.fermata"), names())
     }
 
     /** A WorkManager that starts jobs but never runs their work, so queued jobs stay put. */
@@ -589,7 +602,7 @@ class FermataBackupsTest {
             app.onBeforeBackup = {}
         }
         assertEquals(1, calls)
-        assertEquals(2L, read("minim-phoneA-latest.minim").manifest.eventCount)
+        assertEquals(2L, read("minim-phoneA-g001-base.fermata").header.chainCount)
     }
 
     @Test
@@ -607,6 +620,6 @@ class FermataBackupsTest {
             app.onBeforeBackup = {}
         }
         assertTrue(backups.status().ok)
-        assertEquals(2L, read("minim-phoneA-latest.minim").manifest.eventCount)
+        assertEquals(2L, read("minim-phoneA-g001-base.fermata").header.chainCount)
     }
 }

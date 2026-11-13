@@ -488,6 +488,12 @@ class Fermata(
     /** Events a peer with version vector [heads] has not seen yet. */
     fun eventsAfter(heads: Map<String, Long>): List<Event> = store.after(heads)
 
+    /**
+     * Like [eventsAfter] without the legacy events (imported old rows, which have no counters):
+     * the events of real devices past [heads]. What a backup piece holds.
+     */
+    fun deviceEventsAfter(heads: Map<String, Long>): List<Event> = store.deviceEventsAfter(heads)
+
     /** Every stored event, in log order. */
     fun events(): List<Event> = store.all()
 

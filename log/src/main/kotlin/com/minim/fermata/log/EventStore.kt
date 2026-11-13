@@ -68,4 +68,11 @@ interface EventStore {
 
     /** Events a peer with version vector [heads] has not seen. */
     fun after(heads: Map<String, Long>): List<Event> = EventLog.after(all(), heads)
+
+    /**
+     * Like [after] without the legacy events (which [after] always includes): the events of real
+     * devices past [heads]. What a backup piece appends, so it never decodes the legacy import.
+     */
+    fun deviceEventsAfter(heads: Map<String, Long>): List<Event> =
+        after(heads).filter { it.id.device != EventId.LEGACY_DEVICE }
 }

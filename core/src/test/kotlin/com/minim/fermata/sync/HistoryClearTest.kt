@@ -221,19 +221,20 @@ class HistoryClearTest {
 
         f.clearHistory()
         val result = assertIs<BackupResult.Success>(backups.backUp(folder, replacePrevious = true))
-        assertEquals(listOf("minim-phoneA-latest.minim", "minim-phoneA-previous.minim"), dir.list()!!.sorted())
-        for (name in dir.list()!!) {
-            val archive = File(dir, name).inputStream().use { BackupArchive.read(it) }
-            assertTrue(archive.events.none { EventBody.isHistory(it.body.type) }, "$name still holds history")
-            assertEquals(result.eventCount, archive.manifest.eventCount)
-        }
+        // One new base, which is also the restore point: no file keeps the cleared history.
+        assertEquals(listOf("minim-phoneA-g002-base.fermata"), dir.list()!!.sorted())
+        val base = File(dir, "minim-phoneA-g002-base.fermata").inputStream().use { com.minim.fermata.backup.LogFile.read(it) }
+        assertTrue(base.events.none { EventBody.isHistory(it.body.type) }, "the base still holds history")
+        assertEquals(result.eventCount, base.header.chainCount)
+        assertEquals(com.minim.fermata.backup.ChainPoint(2, 0, base.header.createdAt), base.header.restorePoint)
 
-        // A normal backup afterwards rotates as before.
+        // A normal backup afterwards adds a piece; the restore point stays at the clear.
         clock.now += HOUR
         f.play(a)
         assertIs<BackupResult.Success>(backups.backUp(folder))
-        val previous = File(dir, "minim-phoneA-previous.minim").inputStream().use { BackupArchive.read(it) }
-        assertEquals(result.eventCount, previous.manifest.eventCount)
+        assertEquals(listOf("minim-phoneA-g002-base.fermata", "minim-phoneA-g002-p0001.fermata"), dir.list()!!.sorted())
+        val previous = backups.list(folder).single { it.role == com.minim.fermata.backup.BackupRole.PREVIOUS }
+        assertEquals(result.eventCount, previous.eventCount)
     }
 
     @Test
@@ -250,21 +251,28 @@ class HistoryClearTest {
         assertEquals(setOf("A", "B"), historyIds(phoneA).toSet())
         clock.now += HOUR
 
+        // Keep a copy of the folder from before the clear, as a phone that synced it earlier might.
+        val before = File(dir, "before").also { it.mkdirs() }
+        dir.listFiles()!!.filter { it.isFile }.forEach { it.copyTo(File(before, it.name)) }
         phoneA.clearHistory()
         backupsA.backUp(folder, replacePrevious = true)
         clock.now += MINUTE
         // B still has the old history in its own files; it merges A's clear and drops it.
         backupsB.mergeAndBackUp(folder)
         assertTrue(phoneB.library().history.isEmpty())
-        // A merges B's files (B's previous still holds the old play): nothing comes back.
+        // B started afresh: none of its files hold the old play any more.
+        assertTrue(backupsB.list(folder).none { it.deviceId == "phoneB" && it.role == com.minim.fermata.backup.BackupRole.PREVIOUS })
+        // A merges B's files: nothing comes back.
         clock.now += MINUTE
         backupsA.mergeFromFolder(folder)
         assertTrue(phoneA.library().history.isEmpty())
-        // A third phone restoring B's previous (from before the clear) and then merging the folder.
+        // A third phone restoring B's backup from before the clear and then merging the folder.
         val phoneC = fermata("phoneC")
         val backupsC = FolderBackups(phoneC, InMemoryBackupStateStore(), clock = clock)
-        val bPrevious = backupsC.list(folder).first { it.deviceId == "phoneB" && it.role == com.minim.fermata.backup.BackupRole.PREVIOUS }
-        assertIs<RestoreResult.Success>(backupsC.restore(folder, bPrevious))
+        val old = FileBackupFolder(before)
+        val bOld = backupsC.list(old).first { it.deviceId == "phoneB" }
+        assertIs<RestoreResult.Success>(backupsC.restore(old, bOld))
+        assertEquals(setOf("A", "B"), historyIds(phoneC).toSet())
         backupsC.mergeFromFolder(folder)
         assertTrue(phoneC.library().history.isEmpty())
     }
